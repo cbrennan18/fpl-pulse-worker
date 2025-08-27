@@ -18,9 +18,9 @@ const text = (s, status = 200) =>
 
 // === Cache helpers ===
 // Normalize the request URL (strip querystrings) so cache keys are consistent
-const cacheKeyFor = (request) => {
+const cacheKeyFor = (request, { keepQuery = false } = {}) => {
   const u = new URL(request.url);
-  u.search = ""; // don’t fragment cache by query
+  if (!keepQuery) u.search = ""; // strip by default
   return new Request(u.toString(), { method: "GET" });
 };
 // Standard cache headers: 7 days freshness + 1 day stale-while-revalidate
@@ -120,12 +120,40 @@ export default {
 
     // === Public READ endpoints (edge -> KV only) ===
 
-    // Entry season blob (all GWs for a single FPL team)
+    // Entry season blob (all GWs for a single FPL team) — returns 202 if queued/building
     if (path.startsWith("/v1/entry/")) {
       const parts = path.split("/").filter(Boolean); // ["v1","entry",":id"]
       const entryId = Number(parts[2]);
       if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
-      return cacheFirstKV(request, env, kEntrySeason(entryId, season), isEntrySeason);
+
+      // Edge cache first (path-only key; no query)
+      const cache = caches.default;
+      const ck = cacheKeyFor(request);
+      const edge = await cache.match(ck);
+      if (edge) {
+        const r = new Response(edge.body, edge);
+        r.headers.set("X-Cache", "HIT");
+        r.headers.set("X-App-Version", env.APP_VERSION || "dev");
+        return r;
+      }
+
+      // KV read for the main blob
+      const kvKey = kEntrySeason(entryId, season);
+      const data = await kvGetJSON(env.FPL_PULSE_KV, kvKey);
+      if (data) {
+        if (!isEntrySeason(data)) return json({ error: "Invalid blob", key: kvKey }, 422);
+        const resp = json(data, 200, { ...cacheHeaders(), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
+        try { await cache.put(ck, resp.clone()); } catch {}
+        return resp;
+      }
+
+      // If blob missing, check build state
+      const state = await kvGetJSON(env.FPL_PULSE_KV, kEntryState(entryId, season));
+      if (state && (state.status === "queued" || state.status === "building")) {
+        return json({ status: state.status, last_gw_processed: state.last_gw_processed ?? 0 }, 202);
+      }
+
+      return json({ error: "Not found", key: kvKey }, 404);
     }
 
     // Season elements blob (all players’ scores by GW)
@@ -144,6 +172,57 @@ export default {
       const leagueId = parts[2];
       if (!leagueId) return json({ error: "Missing league id" }, 400);
       return cacheFirstKV(request, env, kLeagueMembers(leagueId), isLeagueMembers);
+    }
+
+    // Pack route: single-page bulk fetch of entry blobs (no pagination)
+    if (path.startsWith("/v1/league/") && path.endsWith("/entries-pack")) {
+      const parts = path.split("/").filter(Boolean); // ["v1","league",":id","entries-pack"]
+      const leagueId = parts[2];
+      if (!leagueId) return json({ error: "Missing league id" }, 400);
+
+      // Edge cache first (no query to consider; single page)
+      const cache = caches.default;
+      const ck = cacheKeyFor(request);
+      const edge = await cache.match(ck);
+      if (edge) {
+        const r = new Response(edge.body, edge);
+        r.headers.set("X-Cache", "HIT");
+        r.headers.set("X-App-Version", env.APP_VERSION || "dev");
+        return r;
+      }
+
+      // Read members
+      const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
+      if (!isLeagueMembers(members)) return json({ error: "Not found or invalid members", leagueId }, 404);
+
+      // Hard cap to protect response size & KV fan-out (tune as needed)
+      const CAP = 150;
+      const slice = members.slice(0, CAP);
+
+      // Batch KV reads
+      const keys = slice.map((id) => kEntrySeason(id, season));
+      const reads = await Promise.all(keys.map((key) => kvGetJSON(env.FPL_PULSE_KV, key)));
+
+      // Assemble payload
+      const entries = {};
+      slice.forEach((entryId, i) => {
+        const blob = reads[i];
+        if (blob && isEntrySeason(blob)) entries[entryId] = blob;
+      });
+
+      const payload = {
+        members: slice,
+        entries,
+        meta: {
+          count: slice.length,
+          capped: members.length > slice.length,
+          total_members: members.length,
+        },
+      };
+
+      const resp = json(payload, 200, { ...cacheHeaders(), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
+      try { await cache.put(ck, resp.clone()); } catch {}
+      return resp;
     }
 
     // Admin endpoints (not yet implemented)
