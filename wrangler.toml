@@ -1,0 +1,17 @@
+name = "fpl-pulse"
+main = "src/worker.js"
+compatibility_date = "2025-08-01"
+
+[vars]
+APP_VERSION = "v0.1"
+SEASON = "2025"
+REFRESH_TOKEN = "CHANGE_ME_TO_A_STRONG_RANDOM"
+
+[[kv_namespaces]]
+binding = "FPL_PULSE_KV"
+id = "c7691d0d89694b94a5951e876d389a76"
+preview_id = "c7691d0d89694b94a5951e876d389a76" # reuse same id if you don’t create a separate preview namespace
+
+[triggers]
+# Run every hour; Worker only harvests when GW is closed
+crons = ["0 * * * *"]
