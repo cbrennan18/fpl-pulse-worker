@@ -301,30 +301,27 @@ export default {
           const url = page === 1 ? BASE : `${BASE}?page_standings=${page}`;
           const data = await fetchJson(url);
 
-          // Expect: data.standings.results = [{ entry, player_name, rank, ... }]
           const results = data?.standings?.results;
+          const hasNext = Boolean(data?.standings?.has_next);
           if (!Array.isArray(results)) {
             return json({ error: "unexpected_fpl_payload", page, sample: (data && Object.keys(data)) || null }, 502);
           }
 
-          for (const row of results) {
-            const entryId = Number(row?.entry);
-            if (Number.isInteger(entryId)) {
-              members.push(entryId);
-              if (members.length > MAX_LEAGUE_SIZE) {
-                // Friends-only policy: refuse large leagues outright
-                return json({
-                  error: "league_too_large",
-                  message: `League exceeds ${MAX_LEAGUE_SIZE} members (e.g., content creator league).`,
-                  leagueId,
-                  collected: members.length
-                }, 403);
-              }
-            }
+          // Friends-only policy: if page 1 has a next page, league > MAX_LEAGUE_SIZE -> refuse
+          if (page === 1 && hasNext) {
+            return json({
+              error: "league_too_large",
+              message: `League exceeds ${MAX_LEAGUE_SIZE} members (friends-only policy).`,
+              leagueId
+            }, 403);
           }
 
-          const hasNext = Boolean(data?.standings?.has_next);
-          if (!hasNext || results.length === 0 || members.length >= MAX_LEAGUE_SIZE) break;
+          for (const row of results) {
+            const entryId = Number(row?.entry);
+            if (Number.isInteger(entryId)) members.push(entryId);
+          }
+
+          if (!hasNext || results.length === 0) break;
           page += 1;
         }
 
