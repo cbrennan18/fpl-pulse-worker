@@ -97,6 +97,14 @@ async function cacheFirstKV(request, env, kvKey, validator = null) {
   return resp;
 }
 
+// === Admin auth helper (Phase 3) ===
+// Accepts ?token=... or X-Refresh-Token header and compares to env.REFRESH_TOKEN
+const isAuthorized = (request, env) => {
+  const u = new URL(request.url);
+  const token = u.searchParams.get("token") || request.headers.get("x-refresh-token");
+  return Boolean(token && token === env.REFRESH_TOKEN);
+};
+
 // === Worker export ===
 // This is the entrypoint for HTTP requests + scheduled cron events
 export default {
@@ -225,8 +233,44 @@ export default {
       return resp;
     }
 
-    // Admin endpoints (not yet implemented)
-    if (path.startsWith("/admin/")) return text("Not implemented yet", 501);
+    // === Admin endpoints (Phase 3 scaffold; all require REFRESH_TOKEN) ===
+    if (path.startsWith("/admin/")) {
+      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+
+      // POST /admin/league/:leagueId/ingest
+      if (path.startsWith("/admin/league/") && path.endsWith("/ingest")) {
+        const parts = path.split("/").filter(Boolean); // ["admin","league",":id","ingest"]
+        const leagueId = parts[2];
+        if (!leagueId) return json({ error: "Missing league id" }, 400);
+        // TODO Phase 4: paginate standings, write league:<id>:members, enqueue entries
+        return json({ ok: true, action: "ingest", leagueId }, 501);
+      }
+
+      // POST /admin/entry/:entryId/enqueue
+      if (path.startsWith("/admin/entry/") && path.endsWith("/enqueue")) {
+        const parts = path.split("/").filter(Boolean); // ["admin","entry",":id","enqueue"]
+        const entryId = Number(parts[2]);
+        if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
+        // TODO Phase 5: set entry:<id>:<SEASON>:state = {status:"queued", ...}
+        return json({ ok: true, action: "enqueue", entryId }, 501);
+      }
+
+      // POST /admin/harvest
+      if (path === "/admin/harvest") {
+        // TODO Phase 6: detect finished GW, append elements + update entries, write snapshot:current
+        return json({ ok: true, action: "harvest" }, 501);
+      }
+
+      // POST /admin/warm
+      if (path === "/admin/warm") {
+        // TODO Phase 7: pre-populate edge cache for hot resources
+        return json({ ok: true, action: "warm" }, 501);
+      }
+
+      return json({ error: "Admin route not found" }, 404);
+    }
+
 
     // Fallback
     return text("Not found", 404);
