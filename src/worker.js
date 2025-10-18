@@ -105,6 +105,24 @@ const isAuthorized = (request, env) => {
   return Boolean(token && token === env.REFRESH_TOKEN);
 };
 
+// === FPL fetch helper (Phase 4) ===
+async function fetchJson(url, init = {}) {
+  const res = await fetch(url, {
+    method: "GET",
+    headers: { "Accept": "application/json", ...(init.headers || {}) },
+    cf: { cacheEverything: false }, // no edge cache on admin fetches
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`FPL fetch failed ${res.status} ${res.statusText} :: ${url} :: ${txt.slice(0,200)}`);
+  }
+  return res.json();
+}
+
+// === Limits === (already added earlier; keep here if missing)
+const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues
+
+
 // === Worker export ===
 // This is the entrypoint for HTTP requests + scheduled cron events
 export default {
@@ -174,13 +192,34 @@ export default {
       return cacheFirstKV(request, env, kSeasonBootstrap(season));
     }
 
-    // League members (list of all entry IDs in a league)
+    // League members (list of all entry IDs in a league) — enforce friends-only policy
     if (path.startsWith("/v1/league/") && path.endsWith("/members")) {
       const parts = path.split("/").filter(Boolean); // ["v1","league",":id","members"]
       const leagueId = parts[2];
       if (!leagueId) return json({ error: "Missing league id" }, 400);
-      return cacheFirstKV(request, env, kLeagueMembers(leagueId), isLeagueMembers);
+
+      // Edge cache first (we'll only cache valid small leagues)
+      const cache = caches.default;
+      const ck = cacheKeyFor(request);
+      const edge = await cache.match(ck);
+      if (edge) {
+        const r = new Response(edge.body, edge);
+        r.headers.set("X-Cache", "HIT");
+        r.headers.set("X-App-Version", env.APP_VERSION || "dev");
+        return r;
+      }
+
+      const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
+      if (!isLeagueMembers(members)) return json({ error: "Not found or invalid members", leagueId }, 404);
+      if (members.length > MAX_LEAGUE_SIZE) {
+        return json({ error: "league_too_large", message: `League has ${members.length} members (> ${MAX_LEAGUE_SIZE})` }, 403);
+      }
+
+      const resp = json(members, 200, { ...cacheHeaders(), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
+      try { await cache.put(ck, resp.clone()); } catch {}
+      return resp;
     }
+
 
     // Pack route: single-page bulk fetch of entry blobs (no pagination)
     if (path.startsWith("/v1/league/") && path.endsWith("/entries-pack")) {
@@ -203,9 +242,14 @@ export default {
       const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
       if (!isLeagueMembers(members)) return json({ error: "Not found or invalid members", leagueId }, 404);
 
-      // Hard cap to protect response size & KV fan-out (tune as needed)
-      const CAP = 150;
-      const slice = members.slice(0, CAP);
+      // Friends-only policy: refuse large leagues outright
+      if (members.length > MAX_LEAGUE_SIZE) {
+        return json({ error: "league_too_large", message: `League has ${members.length} members (> ${MAX_LEAGUE_SIZE})` }, 403);
+      }
+
+      // No pagination by policy; serve all (<= 50)
+      const slice = members; // already <= 50
+
 
       // Batch KV reads
       const keys = slice.map((id) => kEntrySeason(id, season));
@@ -238,13 +282,95 @@ export default {
       if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
       if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
 
-      // POST /admin/league/:leagueId/ingest
+      // POST /admin/league/:leagueId/ingest  (Phase 4)
       if (path.startsWith("/admin/league/") && path.endsWith("/ingest")) {
         const parts = path.split("/").filter(Boolean); // ["admin","league",":id","ingest"]
-        const leagueId = parts[2];
-        if (!leagueId) return json({ error: "Missing league id" }, 400);
-        // TODO Phase 4: paginate standings, write league:<id>:members, enqueue entries
-        return json({ ok: true, action: "ingest", leagueId }, 501);
+        const leagueIdStr = parts[2];
+        const leagueId = Number(leagueIdStr);
+        if (!leagueIdStr) return json({ error: "Missing league id" }, 400);
+        if (!Number.isInteger(leagueId) || leagueId <= 0) return json({ error: "Invalid league id" }, 400);
+
+        const season = Number(env.SEASON || 2025);
+        const BASE = `https://fantasy.premierleague.com/api/leagues-classic/${leagueId}/standings/`;
+
+        // Pull standings pages until we collect <= MAX_LEAGUE_SIZE entries or there are no more pages
+        // FPL classic standings page size is typically 50; enforce hard policy at 50 total.
+        const members = [];
+        let page = 1;
+        while (true) {
+          const url = page === 1 ? BASE : `${BASE}?page_standings=${page}`;
+          const data = await fetchJson(url);
+
+          // Expect: data.standings.results = [{ entry, player_name, rank, ... }]
+          const results = data?.standings?.results;
+          if (!Array.isArray(results)) {
+            return json({ error: "unexpected_fpl_payload", page, sample: (data && Object.keys(data)) || null }, 502);
+          }
+
+          for (const row of results) {
+            const entryId = Number(row?.entry);
+            if (Number.isInteger(entryId)) {
+              members.push(entryId);
+              if (members.length > MAX_LEAGUE_SIZE) {
+                // Friends-only policy: refuse large leagues outright
+                return json({
+                  error: "league_too_large",
+                  message: `League exceeds ${MAX_LEAGUE_SIZE} members (e.g., content creator league).`,
+                  leagueId,
+                  collected: members.length
+                }, 403);
+              }
+            }
+          }
+
+          const hasNext = Boolean(data?.standings?.has_next);
+          if (!hasNext || results.length === 0 || members.length >= MAX_LEAGUE_SIZE) break;
+          page += 1;
+        }
+
+        // De-dupe collected members just in case
+        const uniqueMembers = Array.from(new Set(members));
+
+        // Write league members to KV
+        const leagueKey = kLeagueMembers(leagueIdStr);
+        await kvPutJSON(env.FPL_PULSE_KV, leagueKey, uniqueMembers);
+
+        // Enqueue new entries for backfill: create state if neither blob nor state exists
+        let queuedCount = 0;
+        const nowIso = new Date().toISOString();
+
+        // Batch existence checks in parallel (bounded fan-out)
+        await Promise.all(uniqueMembers.map(async (entryId) => {
+          const seasonKey = kEntrySeason(entryId, season);
+          const stateKey  = kEntryState(entryId, season);
+
+          const [existingSeason, existingState] = await Promise.all([
+            env.FPL_PULSE_KV.get(seasonKey),
+            env.FPL_PULSE_KV.get(stateKey, { type: "json" })
+          ]);
+
+          // If we already have a season blob, skip.
+          if (existingSeason) return;
+
+          // If state exists and is queued/building/complete, skip re-enqueue.
+          if (existingState && typeof existingState === "object" && existingState.status) return;
+
+          // Otherwise enqueue
+          await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+            status: "queued",
+            last_gw_processed: 0,
+            updated_at: nowIso,
+            version: 1
+          });
+          queuedCount += 1;
+        }));
+
+        return json({
+          ok: true,
+          leagueId,
+          members_count: uniqueMembers.length,
+          queued_count: queuedCount
+        }, 200);
       }
 
       // POST /admin/entry/:entryId/enqueue
