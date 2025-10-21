@@ -122,6 +122,130 @@ async function fetchJson(url, init = {}) {
 // === Limits === (already added earlier; keep here if missing)
 const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues
 
+// === Backfill helpers (Phase 5: one-entry test) ===
+async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchJsonWithRetry(url, tries = 3, baseDelay = 200) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const res = await fetch(url, { headers: { "Accept": "application/json" }, cf: { cacheEverything: false } });
+      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+      if (i < tries - 1) await sleep(baseDelay * Math.pow(2, i)); // 200ms, 400ms, 800ms
+    }
+  }
+  throw lastErr;
+}
+
+// Build a single entry season blob (history + transfers + picks 1..targetGW)
+async function processEntryOnce(entryId, season, kv) {
+  const nowIso = new Date().toISOString();
+  const stateKey = kEntryState(entryId, season);
+  const seasonKey = kEntrySeason(entryId, season);
+
+  // Read state and guard
+  const state = await kvGetJSON(kv, stateKey);
+  if (!state || (state.status !== "queued" && state.status !== "building")) {
+    return { ok: false, reason: "not_queued", entryId };
+  }
+
+  // Mark building
+  await kvPutJSON(kv, stateKey, {
+    status: "building",
+    last_gw_processed: state.last_gw_processed ?? 0,
+    worker_started_at: nowIso,
+    attempts: (state.attempts || 0) + 1,
+    updated_at: nowIso,
+  });
+
+  try {
+    // 1) HISTORY
+    const hist = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/history/`);
+    const current = Array.isArray(hist?.current) ? hist.current : [];
+    if (current.length === 0) throw new Error("empty_history");
+
+    // Build gw_summaries and find target GW
+    const gw_summaries = {};
+    let targetGW = 0;
+    for (const row of current) {
+      const gw = Number(row?.event);
+      if (!Number.isInteger(gw)) continue;
+      targetGW = Math.max(targetGW, gw);
+      gw_summaries[gw] = {
+        points: Number(row.points ?? 0),
+        total: Number(row.total_points ?? row.total ?? 0),
+        gw_rank: Number(row.rank ?? 0),
+        overall_rank: Number(row.overall_rank ?? 0),
+        value: Number(row.value ?? 0), // FPL returns x10; keep as-is for now
+        bank: Number(row.bank ?? 0),   // x10; keep as-is
+        chip: row?.chip || null,
+      };
+    }
+    if (targetGW <= 0) throw new Error("no_target_gw");
+
+    // 2) TRANSFERS
+    const transfersRaw = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/transfers/`);
+    const transfers = Array.isArray(transfersRaw) ? transfersRaw.map(t => ({
+      event: Number(t?.event ?? 0),
+      element_in: Number(t?.element_in ?? 0),
+      element_out: Number(t?.element_out ?? 0),
+      cost: Number(t?.cost ?? 0),
+      time: t?.time || null,
+    })) : [];
+
+    // 3) PICKS BY GW (1..targetGW)
+    const picks_by_gw = {};
+    for (let gw = 1; gw <= targetGW; gw++) {
+      const p = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`);
+      const picksArr = Array.isArray(p?.picks) ? p.picks : [];
+      picks_by_gw[gw] = {
+        active_chip: p?.active_chip ?? null,
+        picks: picksArr.map(px => ({
+          element: Number(px?.element ?? 0),
+          position: Number(px?.position ?? 0),
+          is_captain: Boolean(px?.is_captain),
+          is_vice: Boolean(px?.is_vice_captain || px?.is_vice),
+        })),
+      };
+    }
+
+    // 4) Assemble final blob
+    const blob = {
+      entry_id: Number(entryId),
+      season: Number(season),
+      last_gw_processed: Number(targetGW),
+      updated_at: nowIso,
+      version: 1,
+      gw_summaries,
+      picks_by_gw,
+      transfers,
+    };
+
+    // 5) Write blob, then mark complete
+    await kvPutJSON(kv, seasonKey, blob);
+    await kvPutJSON(kv, stateKey, {
+      status: "complete",
+      last_gw_processed: targetGW,
+      updated_at: new Date().toISOString(),
+      attempts: (state.attempts || 0) + 1,
+    });
+
+    return { ok: true, entryId, targetGW };
+  } catch (err) {
+    // Mark errored (non-fatal for the worker)
+    await kvPutJSON(kv, stateKey, {
+      status: "errored",
+      error: String(err?.message || err),
+      updated_at: new Date().toISOString(),
+      attempts: (state?.attempts || 0) + 1,
+    });
+    return { ok: false, reason: "error", entryId, error: String(err?.message || err) };
+  }
+}
+
 
 // === Worker export ===
 // This is the entrypoint for HTTP requests + scheduled cron events
@@ -389,6 +513,38 @@ export default {
       if (path === "/admin/warm") {
         // TODO Phase 7: pre-populate edge cache for hot resources
         return json({ ok: true, action: "warm" }, 501);
+      }
+
+      // POST /admin/backfill?single=true&entry=<id>
+      // Minimal one-entry backfill for testing
+      if (path === "/admin/backfill") {
+        const u = new URL(request.url);
+        const single = u.searchParams.get("single") === "true";
+        const entryParam = u.searchParams.get("entry");
+        const season = Number(env.SEASON || 2025);
+
+        if (!single) {
+          return json({ error: "only_single_supported_for_now", hint: "use ?single=true&entry=<id>" }, 400);
+        }
+        const entryId = Number(entryParam);
+        if (!Number.isInteger(entryId)) {
+          return json({ error: "missing_or_invalid_entry", hint: "provide ?entry=<number>" }, 400);
+        }
+
+        // Ensure there is at least a queued/building state (idempotent)
+        const stateKey = kEntryState(entryId, season);
+        const existingState = await kvGetJSON(env.FPL_PULSE_KV, stateKey);
+        if (!existingState) {
+          await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+            status: "queued",
+            last_gw_processed: 0,
+            updated_at: new Date().toISOString(),
+            version: 1,
+          });
+        }
+
+        const result = await processEntryOnce(entryId, season, env.FPL_PULSE_KV);
+        return json({ ok: !!result.ok, result }, result.ok ? 200 : 207);
       }
 
       return json({ error: "Admin route not found" }, 404);
