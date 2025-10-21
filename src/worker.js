@@ -517,34 +517,98 @@ export default {
 
       // POST /admin/backfill?single=true&entry=<id>
       // Minimal one-entry backfill for testing
+      // POST /admin/backfill
+      // Modes:
+      //   - single:  /admin/backfill?single=true&entry=<id>
+      //   - batch:   /admin/backfill?limit=5[&leagueId=<id>]
       if (path === "/admin/backfill") {
         const u = new URL(request.url);
-        const single = u.searchParams.get("single") === "true";
-        const entryParam = u.searchParams.get("entry");
         const season = Number(env.SEASON || 2025);
 
-        if (!single) {
-          return json({ error: "only_single_supported_for_now", hint: "use ?single=true&entry=<id>" }, 400);
-        }
-        const entryId = Number(entryParam);
-        if (!Number.isInteger(entryId)) {
-          return json({ error: "missing_or_invalid_entry", hint: "provide ?entry=<number>" }, 400);
+        // --- single mode (preserve existing) ---
+        const single = u.searchParams.get("single") === "true";
+        const entryParam = u.searchParams.get("entry");
+        if (single) {
+          const entryId = Number(entryParam);
+          if (!Number.isInteger(entryId)) {
+            return json({ error: "missing_or_invalid_entry", hint: "provide ?entry=<number>" }, 400);
+          }
+          // Ensure state exists
+          const stateKey = kEntryState(entryId, season);
+          const existingState = await kvGetJSON(env.FPL_PULSE_KV, stateKey);
+          if (!existingState) {
+            await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+              status: "queued",
+              last_gw_processed: 0,
+              updated_at: new Date().toISOString(),
+              version: 1,
+            });
+          }
+          const result = await processEntryOnce(entryId, season, env.FPL_PULSE_KV);
+          return json({ ok: !!result.ok, mode: "single", result }, result.ok ? 200 : 207);
         }
 
-        // Ensure there is at least a queued/building state (idempotent)
-        const stateKey = kEntryState(entryId, season);
-        const existingState = await kvGetJSON(env.FPL_PULSE_KV, stateKey);
-        if (!existingState) {
-          await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
-            status: "queued",
-            last_gw_processed: 0,
-            updated_at: new Date().toISOString(),
-            version: 1,
-          });
+        // --- batch mode ---
+        const limit = Math.max(1, Math.min(10, Number(u.searchParams.get("limit") || 5))); // cap 1..10
+        const leagueId = u.searchParams.get("leagueId"); // optional: restrict to one league
+
+        // Collect candidate entryIds to consider
+        let candidates = [];
+        if (leagueId) {
+          // From one league (≤ 50)
+          const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
+          if (!isLeagueMembers(members)) {
+            return json({ error: "invalid_or_missing_league", leagueId }, 404);
+          }
+          candidates = members;
+        } else {
+          // Global small scan (dev scale): list keys and extract entry ids with :<season>:state
+          // NOTE: fine for our small dataset (hundreds). Revisit if scaling up.
+          let cursor = undefined;
+          do {
+            const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor });
+            cursor = page.cursor;
+            for (const k of page.keys) {
+              // Expect keys like entry:<id>:<season>:state
+              if (k.name.endsWith(`:${season}:state`)) {
+                const parts = k.name.split(":"); // ["entry","<id>","<season>","state"]
+                const id = Number(parts[1]);
+                if (Number.isInteger(id)) candidates.push(id);
+              }
+            }
+            // Stop early if we already have plenty of candidates to check states
+            if (candidates.length >= 200) break;
+          } while (cursor);
+          // De-dupe
+          candidates = Array.from(new Set(candidates));
         }
 
-        const result = await processEntryOnce(entryId, season, env.FPL_PULSE_KV);
-        return json({ ok: !!result.ok, result }, result.ok ? 200 : 207);
+        // Read states and pick queued up to limit
+        const queued = [];
+        for (const id of candidates) {
+          if (queued.length >= limit) break;
+          const st = await kvGetJSON(env.FPL_PULSE_KV, kEntryState(id, season));
+          if (st && st.status === "queued") queued.push(id);
+        }
+
+        // Process sequentially (safe)
+        const results = [];
+        for (const id of queued) {
+          const r = await processEntryOnce(id, season, env.FPL_PULSE_KV);
+          results.push(r);
+        }
+
+        const summary = {
+          ok: true,
+          mode: "batch",
+          leagueId: leagueId || null,
+          requested: limit,
+          processed: results.length,
+          succeeded: results.filter(r => r.ok).length,
+          errored: results.filter(r => !r.ok).length,
+          ids: queued,
+        };
+        return json(summary, 200);
       }
 
       return json({ error: "Admin route not found" }, 404);
