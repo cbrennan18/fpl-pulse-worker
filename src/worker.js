@@ -146,9 +146,28 @@ async function processEntryOnce(entryId, season, kv) {
   const stateKey = kEntryState(entryId, season);
   const seasonKey = kEntrySeason(entryId, season);
 
-  // Read state and guard
-  const state = await kvGetJSON(kv, stateKey);
-  if (!state || (state.status !== "queued" && state.status !== "building")) {
+  // Read state and guard (+ stale-building reset)
+  let state = await kvGetJSON(kv, stateKey);
+  if (!state) {
+    return { ok: false, reason: "not_queued", entryId };
+  }
+
+  // If stuck in "building" for > 60 minutes, reset to queued
+  if (state.status === "building") {
+    const started = state.worker_started_at ? Date.parse(state.worker_started_at) : 0;
+    const ageMs = Date.now() - (isNaN(started) ? 0 : started);
+    if (ageMs > 60 * 60 * 1000) {
+      state = {
+        status: "queued",
+        last_gw_processed: state.last_gw_processed ?? 0,
+        updated_at: new Date().toISOString(),
+        version: (state.version ?? 0) + 1,
+      };
+      await kvPutJSON(kv, stateKey, state);
+    }
+  }
+
+  if (state.status !== "queued" && state.status !== "building") {
     return { ok: false, reason: "not_queued", entryId };
   }
 
@@ -499,8 +518,33 @@ export default {
         const parts = path.split("/").filter(Boolean); // ["admin","entry",":id","enqueue"]
         const entryId = Number(parts[2]);
         if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
-        // TODO Phase 5: set entry:<id>:<SEASON>:state = {status:"queued", ...}
-        return json({ ok: true, action: "enqueue", entryId }, 501);
+
+        const seasonNum = Number(env.SEASON || 2025);
+        const stateKey = kEntryState(entryId, seasonNum);
+        const seasonKey = kEntrySeason(entryId, seasonNum);
+
+        const [existingBlob, existingState] = await Promise.all([
+          env.FPL_PULSE_KV.get(seasonKey),
+          kvGetJSON(env.FPL_PULSE_KV, stateKey),
+        ]);
+
+        // If blob already exists, no need to enqueue
+        if (existingBlob) return json({ ok: true, status: "already_complete", entryId }, 200);
+
+        // If state exists and is queued/building, don’t double-enqueue
+        if (existingState && (existingState.status === "queued" || existingState.status === "building")) {
+          return json({ ok: true, status: existingState.status, entryId }, 200);
+        }
+
+        // Otherwise set queued
+        await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+          status: "queued",
+          last_gw_processed: existingState?.last_gw_processed ?? 0,
+          updated_at: new Date().toISOString(),
+          version: (existingState?.version ?? 0) + 1,
+        });
+
+        return json({ ok: true, status: "queued", entryId }, 200);
       }
 
       // POST /admin/harvest
