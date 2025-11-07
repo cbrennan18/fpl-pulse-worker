@@ -389,6 +389,49 @@ async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   return { status: "ok", last_gw: prevId };
 }
 
+// === Phase 7: cache warm helper ===
+async function warmCache(env) {
+  const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
+  const season = Number(env.SEASON || 2025);
+  const cache = caches.default;
+  const warmed = [];
+
+  // Warm global endpoints
+  const globals = [
+    `${base}/v1/season/elements`,
+    `${base}/v1/season/bootstrap`
+  ];
+
+  for (const url of globals) {
+    const req = new Request(url);
+    const resp = await fetch(req);
+    if (resp.ok) await cache.put(req, resp.clone());
+    warmed.push(url);
+  }
+
+  // Warm top league entries (optional)
+  const LEAGUE_ID = env.WARM_LEAGUE_ID || null; // optional env var
+  if (LEAGUE_ID) {
+    const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(LEAGUE_ID));
+    if (Array.isArray(members)) {
+      const slice = members.slice(0, 10);
+      for (const id of slice) {
+        const u = `${base}/v1/entry/${id}`;
+        const req = new Request(u);
+        const resp = await fetch(req);
+        if (resp.ok) await cache.put(req, resp.clone());
+        warmed.push(u);
+      }
+      const pack = `${base}/v1/league/${LEAGUE_ID}/entries-pack`;
+      const r = await fetch(pack);
+      if (r.ok) await cache.put(new Request(pack), r.clone());
+      warmed.push(pack);
+    }
+  }
+
+  return { status: "ok", warmed };
+}
+
 // === Worker export ===
 // This is the entrypoint for HTTP requests + scheduled cron events
 export default {
@@ -679,8 +722,8 @@ export default {
 
       // POST /admin/warm
       if (path === "/admin/warm") {
-        // TODO Phase 7: pre-populate edge cache for hot resources
-        return json({ ok: true, action: "warm" }, 501);
+        const res = await warmCache(env);
+        return json(res, 200);
       }
 
       // POST /admin/backfill?single=true&entry=<id>
