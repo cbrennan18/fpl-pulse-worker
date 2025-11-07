@@ -265,6 +265,129 @@ async function processEntryOnce(entryId, season, kv) {
   }
 }
 
+// === Phase 6: harvest helpers ===
+async function fetchBootstrap() {
+  return fetchJsonWithRetry("https://fantasy.premierleague.com/api/bootstrap-static/");
+}
+
+function detectLatestFinishedGW(bootstrap) {
+  const done = Array.isArray(bootstrap?.events)
+    ? bootstrap.events.filter(e => e?.finished === true && e?.data_checked === true)
+    : [];
+  if (!done.length) return null;
+  return Math.max(...done.map(e => Number(e.id)).filter(Number.isFinite));
+}
+
+async function appendElementsForGW(env, season, gw) {
+  const key = kSeasonElements(season);
+  const cur = (await kvGetJSON(env.FPL_PULSE_KV, key)) || { last_gw_processed: 0, gws: {} };
+  if (!cur.gws || typeof cur.gws !== "object") cur.gws = {};
+  if (cur.gws[gw]) return { wrote: false, reason: "already_present" };
+
+  const live = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/event/${gw}/live/`);
+  cur.gws[gw] = live;
+  cur.last_gw_processed = Math.max(Number(cur.last_gw_processed || 0), gw);
+  await kvPutJSON(env.FPL_PULSE_KV, key, cur);
+  return { wrote: true };
+}
+
+async function updateEntryForGW(env, season, entryId, gw) {
+  const seasonKey = kEntrySeason(entryId, season);
+  const blob = await kvGetJSON(env.FPL_PULSE_KV, seasonKey);
+  if (!blob || typeof blob !== "object") return { updated: false, reason: "no_blob" };
+
+  let changed = false;
+
+  if (!blob.gw_summaries || typeof blob.gw_summaries !== "object") blob.gw_summaries = {};
+  if (!blob.gw_summaries[gw]) {
+    const hist = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/history/`);
+    const row = Array.isArray(hist?.current) ? hist.current.find(r => Number(r?.event) === gw) : null;
+    if (row) {
+      blob.gw_summaries[gw] = {
+        points: Number(row.points ?? 0),
+        total: Number(row.total_points ?? row.total ?? 0),
+        gw_rank: Number(row.rank ?? 0),
+        overall_rank: Number(row.overall_rank ?? 0),
+        value: Number(row.value ?? 0),
+        bank: Number(row.bank ?? 0),
+        chip: row?.chip || null,
+      };
+      changed = true;
+    }
+  }
+
+  if (!blob.picks_by_gw || typeof blob.picks_by_gw !== "object") blob.picks_by_gw = {};
+  if (!blob.picks_by_gw[gw]) {
+    const picks = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`);
+    const arr = Array.isArray(picks?.picks) ? picks.picks : [];
+    blob.picks_by_gw[gw] = {
+      active_chip: picks?.active_chip ?? null,
+      picks: arr.map(px => ({
+        element: Number(px?.element ?? 0),
+        position: Number(px?.position ?? 0),
+        is_captain: Boolean(px?.is_captain),
+        is_vice: Boolean(px?.is_vice_captain || px?.is_vice),
+      })),
+    };
+    changed = true;
+  }
+
+  if (changed) {
+    blob.last_gw_processed = Math.max(Number(blob.last_gw_processed || 0), gw);
+    blob.updated_at = new Date().toISOString();
+    await kvPutJSON(env.FPL_PULSE_KV, seasonKey, blob);
+  }
+  return { updated: changed };
+}
+
+async function updateSnapshot(env, season, gw) {
+  await kvPutJSON(env.FPL_PULSE_KV, kSnapshotCurrent, { season: Number(season), last_gw: Number(gw) });
+}
+
+async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
+  const season = Number(env.SEASON || 2025);
+  const t0 = Date.now();
+
+  const bootstrap = await fetchBootstrap();
+  const prevId = detectLatestFinishedGW(bootstrap);
+  if (!Number.isInteger(prevId)) return { status: "noop", reason: "no_finished_gw" };
+
+  const snap = (await kvGetJSON(env.FPL_PULSE_KV, kSnapshotCurrent)) || { season, last_gw: 0 };
+  if (Number(snap.last_gw || 0) >= prevId) {
+    return { status: "noop", reason: "already_up_to_date", last_gw: snap.last_gw };
+  }
+
+  if (delaySec && delaySec > 0) {
+    return { status: "delayed", recommend_reinvoke_after_sec: delaySec, candidate_gw: prevId };
+  }
+
+  await kvPutJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season), bootstrap);
+  await appendElementsForGW(env, season, prevId);
+
+  let cursor;
+  const concurrency = 5;
+  const pending = [];
+  do {
+    const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor });
+    cursor = page.cursor;
+
+    for (const k of page.keys) {
+      if ((Date.now() - t0) > 25_000) break; // ~25s budget
+      if (!k.name.endsWith(`:${season}`)) continue; // only complete blobs
+      const id = Number(k.name.split(":")[1]);
+      if (!Number.isInteger(id)) continue;
+
+      pending.push(updateEntryForGW(env, season, id, prevId));
+      if (pending.length >= concurrency) {
+        await Promise.all(pending.splice(0));
+      }
+    }
+  } while (cursor && (Date.now() - t0) <= 25_000);
+  if (pending.length) await Promise.all(pending);
+
+  await updateSnapshot(env, season, prevId);
+  return { status: "ok", last_gw: prevId };
+}
 
 // === Worker export ===
 // This is the entrypoint for HTTP requests + scheduled cron events
@@ -547,10 +670,11 @@ export default {
         return json({ ok: true, status: "queued", entryId }, 200);
       }
 
-      // POST /admin/harvest
+      // POST /admin/harvest?delay=1800
       if (path === "/admin/harvest") {
-        // TODO Phase 6: detect finished GW, append elements + update entries, write snapshot:current
-        return json({ ok: true, action: "harvest" }, 501);
+        const delay = Number(new URL(request.url).searchParams.get("delay") || 0);
+        const res = await harvestIfNeeded(env, { delaySec: delay });
+        return json(res, res.status === "ok" || res.status === "noop" ? 200 : 202);
       }
 
       // POST /admin/warm
@@ -664,10 +788,15 @@ export default {
   },
 
   // === Cron handler ===
-  // For now: write a heartbeat key to KV every scheduled run
+  // Run harvest; also write a heartbeat key
   async scheduled(event, env, ctx) {
-    try {
-      await env.FPL_PULSE_KV.put(`heartbeat:${new Date(event.scheduledTime).toISOString()}`, "1", { expirationTtl: 3600 });
-    } catch {}
+    ctx.waitUntil((async () => {
+      try {
+        await env.FPL_PULSE_KV.put(`heartbeat:${new Date(event.scheduledTime).toISOString()}`, "1", { expirationTtl: 3600 });
+      } catch {}
+      try {
+        await harvestIfNeeded(env);
+      } catch {}
+    })());
   },
 };
