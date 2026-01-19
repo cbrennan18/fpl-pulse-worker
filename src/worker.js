@@ -1125,9 +1125,41 @@ export default {
           version: (existingState?.version ?? 0) + 1,
         });
 
+        // Small delay to ensure KV write propagates (eventual consistency)
+        await sleep(500);
+
         // Optionally keep or overwrite the old blob; processEntryOnce will overwrite anyway
         const result = await processEntryOnce(entryId, seasonNum, env.FPL_PULSE_KV);
+
+        // Also purge edge cache for this entry
+        try {
+          const url = new URL(request.url);
+          const cacheUrl = `${url.protocol}//${url.host}/v1/entry/${entryId}`;
+          const cacheKey = cacheKeyFor(new Request(cacheUrl));
+          await caches.default.delete(cacheKey);
+        } catch (e) {
+          console.warn('Failed to purge cache:', e);
+        }
+
         return json({ ok: !!result.ok, mode: "force-rebuild", result }, result.ok ? 200 : 207);
+      }
+
+      // POST /admin/entry/:entryId/purge-cache
+      // Purge edge cache for a specific entry
+      if (path.startsWith("/admin/entry/") && path.endsWith("/purge-cache")) {
+        const parts = path.split("/").filter(Boolean); // ["admin","entry",":id","purge-cache"]
+        const entryId = Number(parts[2]);
+        if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
+
+        try {
+          const url = new URL(request.url);
+          const cacheUrl = `${url.protocol}//${url.host}/v1/entry/${entryId}`;
+          const cacheKey = cacheKeyFor(new Request(cacheUrl));
+          const deleted = await caches.default.delete(cacheKey);
+          return json({ ok: true, deleted, entry_id: entryId }, 200);
+        } catch (e) {
+          return json({ ok: false, error: e.message }, 500);
+        }
       }
 
       // POST /admin/entry/:entryId/enqueue
