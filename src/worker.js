@@ -28,6 +28,23 @@ const cacheHeaders = (ttl = 604800, swr = 86400) => ({
   "Cache-Control": `public, s-maxage=${ttl}, stale-while-revalidate=${swr}`,
 });
 
+// Dynamic cache TTL based on gameweek state
+// Returns shorter TTL during active GW, longer for finished GWs
+const dynamicCacheHeaders = (bootstrap = null) => {
+  if (!bootstrap?.events) return cacheHeaders(); // Default 7 days
+
+  // Check if there's an active (ongoing) gameweek
+  const activeGW = bootstrap.events.find(e => e?.is_current === true && e?.finished === false);
+
+  if (activeGW) {
+    // Active GW: use shorter cache (6 hours) for fresher data
+    return cacheHeaders(6 * 3600, 3600); // 6h cache, 1h SWR
+  }
+
+  // No active GW: use standard long cache (7 days)
+  return cacheHeaders(); // 7 days
+};
+
 // === KV JSON helpers ===
 // Get and Put JSON in KV with consistent behaviour
 async function kvGetJSON(kv, key) {
@@ -122,25 +139,89 @@ async function fetchJson(url, init = {}) {
 // === Limits === (already added earlier; keep here if missing)
 const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues
 
+// === Circuit breaker for FPL API ===
+// Prevents hammering FPL API when it's down
+const circuitBreaker = {
+  failures: 0,
+  openUntil: 0,
+  maxFailures: 5,
+  resetTimeout: 15 * 60 * 1000, // 15 minutes
+
+  isOpen() {
+    if (this.openUntil > 0 && Date.now() < this.openUntil) {
+      return true;
+    }
+    if (this.openUntil > 0 && Date.now() >= this.openUntil) {
+      // Circuit breaker timeout expired, reset
+      this.reset();
+    }
+    return false;
+  },
+
+  recordFailure() {
+    this.failures++;
+    if (this.failures >= this.maxFailures) {
+      this.openUntil = Date.now() + this.resetTimeout;
+      console.error(`Circuit breaker OPEN - FPL API failures: ${this.failures}, waiting ${this.resetTimeout / 60000}min`);
+    }
+  },
+
+  recordSuccess() {
+    if (this.failures > 0) {
+      this.failures = Math.max(0, this.failures - 1); // Gradual recovery
+    }
+  },
+
+  reset() {
+    this.failures = 0;
+    this.openUntil = 0;
+    console.log('Circuit breaker RESET - FPL API recovered');
+  }
+};
+
 // === Backfill helpers (Phase 5: one-entry test) ===
 async function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
 async function fetchJsonWithRetry(url, tries = 3, baseDelay = 200) {
+  // Check circuit breaker before making request
+  if (circuitBreaker.isOpen()) {
+    throw new Error(`Circuit breaker OPEN - FPL API temporarily unavailable`);
+  }
+
   let lastErr;
   for (let i = 0; i < tries; i++) {
     try {
       const res = await fetch(url, { headers: { "Accept": "application/json" }, cf: { cacheEverything: false } });
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+
+      // Handle rate limiting and service unavailability
+      if (res.status === 429 || res.status === 503) {
+        const retryAfter = res.headers.get("Retry-After");
+        const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : Math.min(baseDelay * Math.pow(2, i + 2), 10000);
+        console.warn(`Rate limited or service unavailable (${res.status}) for ${url}, waiting ${waitMs}ms`);
+        circuitBreaker.recordFailure();
+        if (i < tries - 1) await sleep(waitMs);
+        lastErr = new Error(`HTTP ${res.status} for ${url}`);
+        continue;
+      }
+
+      if (!res.ok) {
+        circuitBreaker.recordFailure();
+        throw new Error(`HTTP ${res.status} for ${url}`);
+      }
+
+      // Success - record it for circuit breaker
+      circuitBreaker.recordSuccess();
       return await res.json();
     } catch (err) {
       lastErr = err;
+      circuitBreaker.recordFailure();
       if (i < tries - 1) await sleep(baseDelay * Math.pow(2, i)); // 200ms, 400ms, 800ms
     }
   }
   throw lastErr;
 }
 
-// Build a single entry season blob (history + transfers + picks 1..targetGW)
+// Build a single entry season blob (summary + history + transfers + picks 1..targetGW)
 async function processEntryOnce(entryId, season, kv) {
   const nowIso = new Date().toISOString();
   const stateKey = kEntryState(entryId, season);
@@ -181,8 +262,15 @@ async function processEntryOnce(entryId, season, kv) {
   });
 
   try {
+    // 0) ENTRY SUMMARY (names, leagues, etc.)
+    const summary = await fetchJsonWithRetry(
+      `https://fantasy.premierleague.com/api/entry/${entryId}/`
+    );
+
     // 1) HISTORY
-    const hist = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/history/`);
+    const hist = await fetchJsonWithRetry(
+      `https://fantasy.premierleague.com/api/entry/${entryId}/history/`
+    );
     const current = Array.isArray(hist?.current) ? hist.current : [];
     if (current.length === 0) throw new Error("empty_history");
 
@@ -206,19 +294,37 @@ async function processEntryOnce(entryId, season, kv) {
     if (targetGW <= 0) throw new Error("no_target_gw");
 
     // 2) TRANSFERS
-    const transfersRaw = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/transfers/`);
-    const transfers = Array.isArray(transfersRaw) ? transfersRaw.map(t => ({
-      event: Number(t?.event ?? 0),
-      element_in: Number(t?.element_in ?? 0),
-      element_out: Number(t?.element_out ?? 0),
-      cost: Number(t?.cost ?? 0),
-      time: t?.time || null,
-    })) : [];
+    const transfersRaw = await fetchJsonWithRetry(
+      `https://fantasy.premierleague.com/api/entry/${entryId}/transfers/`
+    );
+    const transfers = Array.isArray(transfersRaw)
+      ? transfersRaw.map(t => ({
+          event: Number(t?.event ?? 0),
+          element_in: Number(t?.element_in ?? 0),
+          element_out: Number(t?.element_out ?? 0),
+          cost: Number(t?.cost ?? 0),
+          time: t?.time || null,
+        }))
+      : [];
 
     // 3) PICKS BY GW (1..targetGW)
-    const picks_by_gw = {};
-    for (let gw = 1; gw <= targetGW; gw++) {
-      const p = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`);
+    // Smart partial backfill: check if we have an existing blob and only fetch missing GWs
+    const existingBlob = await kvGetJSON(kv, seasonKey);
+    const picks_by_gw = (existingBlob && typeof existingBlob.picks_by_gw === "object")
+      ? { ...existingBlob.picks_by_gw }
+      : {};
+
+    const startGW = existingBlob?.last_gw_processed
+      ? Math.min(existingBlob.last_gw_processed + 1, targetGW)
+      : 1;
+
+    // Only fetch GWs we don't already have
+    for (let gw = startGW; gw <= targetGW; gw++) {
+      if (picks_by_gw[gw]) continue; // Skip if we already have this GW
+
+      const p = await fetchJsonWithRetry(
+        `https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`
+      );
       const picksArr = Array.isArray(p?.picks) ? p.picks : [];
       picks_by_gw[gw] = {
         active_chip: p?.active_chip ?? null,
@@ -231,6 +337,27 @@ async function processEntryOnce(entryId, season, kv) {
       };
     }
 
+    // If this is a partial update and we're missing early GWs, backfill them too
+    if (existingBlob && startGW > 1) {
+      for (let gw = 1; gw < startGW; gw++) {
+        if (picks_by_gw[gw]) continue; // Skip if we already have this GW
+
+        const p = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`
+        );
+        const picksArr = Array.isArray(p?.picks) ? p.picks : [];
+        picks_by_gw[gw] = {
+          active_chip: p?.active_chip ?? null,
+          picks: picksArr.map(px => ({
+            element: Number(px?.element ?? 0),
+            position: Number(px?.position ?? 0),
+            is_captain: Boolean(px?.is_captain),
+            is_vice: Boolean(px?.is_vice_captain || px?.is_vice),
+          })),
+        };
+      }
+    }
+
     // 4) Assemble final blob
     const blob = {
       entry_id: Number(entryId),
@@ -241,6 +368,10 @@ async function processEntryOnce(entryId, season, kv) {
       gw_summaries,
       picks_by_gw,
       transfers,
+      // New: store full entry summary + refresh timestamps
+      summary,
+      summary_last_refreshed_at: nowIso,
+      transfers_last_refreshed_at: nowIso,
     };
 
     // 5) Write blob, then mark complete
@@ -298,10 +429,15 @@ async function updateEntryForGW(env, season, entryId, gw) {
 
   let changed = false;
 
+  // --- GW summary for this event ---
   if (!blob.gw_summaries || typeof blob.gw_summaries !== "object") blob.gw_summaries = {};
   if (!blob.gw_summaries[gw]) {
-    const hist = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/history/`);
-    const row = Array.isArray(hist?.current) ? hist.current.find(r => Number(r?.event) === gw) : null;
+    const hist = await fetchJsonWithRetry(
+      `https://fantasy.premierleague.com/api/entry/${entryId}/history/`
+    );
+    const row = Array.isArray(hist?.current)
+      ? hist.current.find(r => Number(r?.event) === gw)
+      : null;
     if (row) {
       blob.gw_summaries[gw] = {
         points: Number(row.points ?? 0),
@@ -316,9 +452,12 @@ async function updateEntryForGW(env, season, entryId, gw) {
     }
   }
 
+  // --- Picks for this event ---
   if (!blob.picks_by_gw || typeof blob.picks_by_gw !== "object") blob.picks_by_gw = {};
   if (!blob.picks_by_gw[gw]) {
-    const picks = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`);
+    const picks = await fetchJsonWithRetry(
+      `https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`
+    );
     const arr = Array.isArray(picks?.picks) ? picks.picks : [];
     blob.picks_by_gw[gw] = {
       active_chip: picks?.active_chip ?? null,
@@ -332,11 +471,73 @@ async function updateEntryForGW(env, season, entryId, gw) {
     changed = true;
   }
 
+  // --- Refresh transfers so they stay up to date ---
+  // Only refresh if stale (>6 hours) to reduce API calls
+  const transfersLastRefreshed = blob.transfers_last_refreshed_at
+    ? Date.parse(blob.transfers_last_refreshed_at)
+    : 0;
+  const transfersStale = !blob.transfers_last_refreshed_at ||
+    (Date.now() - transfersLastRefreshed) > 6 * 3600 * 1000;
+
+  if (transfersStale) {
+    try {
+      const transfersRaw = await fetchJsonWithRetry(
+        `https://fantasy.premierleague.com/api/entry/${entryId}/transfers/`
+      );
+      const transfers = Array.isArray(transfersRaw)
+        ? transfersRaw.map(t => ({
+            event: Number(t?.event ?? 0),
+            element_in: Number(t?.element_in ?? 0),
+            element_out: Number(t?.element_out ?? 0),
+            cost: Number(t?.cost ?? 0),
+            time: t?.time || null,
+          }))
+        : [];
+
+      const prevLen = Array.isArray(blob.transfers) ? blob.transfers.length : 0;
+      blob.transfers = transfers;
+      blob.transfers_last_refreshed_at = new Date().toISOString();
+      if (transfers.length !== prevLen) {
+        changed = true;
+      }
+    } catch (err) {
+      console.warn(
+        `Failed to refresh transfers for entry ${entryId}:`,
+        String(err?.message || err)
+      );
+    }
+  }
+
+  // --- Refresh summary (names, leagues, etc.) ---
+  // Only refresh if stale (>12 hours) - summary data rarely changes
+  const summaryLastRefreshed = blob.summary_last_refreshed_at
+    ? Date.parse(blob.summary_last_refreshed_at)
+    : 0;
+  const summaryStale = !blob.summary_last_refreshed_at ||
+    (Date.now() - summaryLastRefreshed) > 12 * 3600 * 1000;
+
+  if (summaryStale) {
+    try {
+      const summary = await fetchJsonWithRetry(
+        `https://fantasy.premierleague.com/api/entry/${entryId}/`
+      );
+      blob.summary = summary;
+      blob.summary_last_refreshed_at = new Date().toISOString();
+      changed = true; // small blob; fine to treat as changed
+    } catch (err) {
+      console.warn(
+        `Failed to refresh summary for entry ${entryId}:`,
+        String(err?.message || err)
+      );
+    }
+  }
+
   if (changed) {
     blob.last_gw_processed = Math.max(Number(blob.last_gw_processed || 0), gw);
     blob.updated_at = new Date().toISOString();
     await kvPutJSON(env.FPL_PULSE_KV, seasonKey, blob);
   }
+
   return { updated: changed };
 }
 
@@ -364,26 +565,43 @@ async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   await kvPutJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season), bootstrap);
   await appendElementsForGW(env, season, prevId);
 
+  // Harvest optimization: batch KV list reads and process in parallel
   let cursor;
   const concurrency = 5;
   const pending = [];
+  let processedCount = 0;
+  const allEntryIds = [];
+
+  // First, collect all entry IDs that need updating
   do {
-    const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor });
+    const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor, limit: 100 });
     cursor = page.cursor;
 
     for (const k of page.keys) {
-      if ((Date.now() - t0) > 25_000) break; // ~25s budget
       if (!k.name.endsWith(`:${season}`)) continue; // only complete blobs
       const id = Number(k.name.split(":")[1]);
       if (!Number.isInteger(id)) continue;
-
-      pending.push(updateEntryForGW(env, season, id, prevId));
-      if (pending.length >= concurrency) {
-        await Promise.all(pending.splice(0));
-      }
+      allEntryIds.push(id);
     }
-  } while (cursor && (Date.now() - t0) <= 25_000);
+  } while (cursor);
+
+  // Now process entries in batches with time budget
+  for (const id of allEntryIds) {
+    if ((Date.now() - t0) > 25_000) {
+      console.warn(`Harvest timeout approaching, processed ${processedCount}/${allEntryIds.length} entries`);
+      break;
+    }
+
+    pending.push(updateEntryForGW(env, season, id, prevId).then(() => { processedCount++; }));
+
+    if (pending.length >= concurrency) {
+      await Promise.all(pending.splice(0));
+    }
+  }
+
   if (pending.length) await Promise.all(pending);
+
+  console.log(`Harvest completed: ${processedCount}/${allEntryIds.length} entries updated in ${Date.now() - t0}ms`);
 
   await updateSnapshot(env, season, prevId);
   return { status: "ok", last_gw: prevId };
@@ -453,6 +671,80 @@ export default {
       });
     }
 
+    // Detailed health check endpoint
+    if (path === "/health/detailed") {
+      try {
+        const snapshot = await kvGetJSON(env.FPL_PULSE_KV, kSnapshotCurrent);
+        const bootstrap = await kvGetJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season));
+
+        // Count errored entries
+        let erroredCount = 0;
+        let queuedCount = 0;
+        let buildingCount = 0;
+        let completeCount = 0;
+
+        let cursor;
+        do {
+          const page = await env.FPL_PULSE_KV.list({ prefix: `entry:`, cursor, limit: 100 });
+          cursor = page.cursor;
+
+          for (const k of page.keys) {
+            if (k.name.endsWith(`:${season}:state`)) {
+              const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
+              if (state?.status === "errored") erroredCount++;
+              else if (state?.status === "queued") queuedCount++;
+              else if (state?.status === "building") buildingCount++;
+              else if (state?.status === "complete") completeCount++;
+            }
+          }
+
+          // Limit scan to prevent timeout
+          if (erroredCount + queuedCount + buildingCount + completeCount > 200) break;
+        } while (cursor);
+
+        // Detect active GW
+        const activeGW = bootstrap?.events?.find(e => e?.is_current === true && e?.finished === false);
+
+        return json({
+          status: "ok",
+          version: env.APP_VERSION || "dev",
+          season,
+          timestamp: new Date().toISOString(),
+          kv: {
+            bound: env.FPL_PULSE_KV ? true : false,
+            namespace_id: env.FPL_PULSE_KV?.namespace || "unknown",
+          },
+          snapshot: {
+            last_gw_processed: snapshot?.last_gw ?? 0,
+            season: snapshot?.season ?? season,
+          },
+          gameweek: {
+            active: activeGW ? activeGW.id : null,
+            active_name: activeGW ? activeGW.name : null,
+            is_finished: activeGW ? activeGW.finished : null,
+          },
+          entries: {
+            errored: erroredCount,
+            queued: queuedCount,
+            building: buildingCount,
+            complete: completeCount,
+            total: erroredCount + queuedCount + buildingCount + completeCount,
+          },
+          circuit_breaker: {
+            is_open: circuitBreaker.isOpen(),
+            failures: circuitBreaker.failures,
+            open_until: circuitBreaker.openUntil > 0 ? new Date(circuitBreaker.openUntil).toISOString() : null,
+          },
+        });
+      } catch (err) {
+        return json({
+          status: "degraded",
+          error: String(err?.message || err),
+          version: env.APP_VERSION || "dev",
+        }, 503);
+      }
+    }
+
     // === Public READ endpoints (edge -> KV only) ===
 
     // Entry season blob (all GWs for a single FPL team) — returns 202 if queued/building
@@ -477,7 +769,22 @@ export default {
       const data = await kvGetJSON(env.FPL_PULSE_KV, kvKey);
       if (data) {
         if (!isEntrySeason(data)) return json({ error: "Invalid blob", key: kvKey }, 422);
-        const resp = json(data, 200, { ...cacheHeaders(), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
+
+        // Use dynamic cache based on GW state
+        const bootstrap = await kvGetJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season));
+        const headers = { ...dynamicCacheHeaders(bootstrap), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" };
+
+        // Add stale data headers for observability
+        if (data.updated_at) {
+          const ageMs = Date.now() - Date.parse(data.updated_at);
+          const ageDays = Math.floor(ageMs / (24 * 3600 * 1000));
+          headers["X-Data-Age-Days"] = String(ageDays);
+          if (ageMs > 7 * 24 * 3600 * 1000) { // Older than 7 days
+            headers["X-Data-Stale"] = "true";
+          }
+        }
+
+        const resp = json(data, 200, headers);
         try { await cache.put(ck, resp.clone()); } catch {}
         return resp;
       }
@@ -581,9 +888,126 @@ export default {
         },
       };
 
-      const resp = json(payload, 200, { ...cacheHeaders(), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
+      // Use dynamic cache based on GW state
+      const bootstrap = await kvGetJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season));
+      const resp = json(payload, 200, { ...dynamicCacheHeaders(bootstrap), "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
       try { await cache.put(ck, resp.clone()); } catch {}
       return resp;
+    }
+
+    // === Backward-compatible proxy routes (for frontend migration) ===
+
+    // GET /fpl/bootstrap → proxy to FPL bootstrap (or redirect to /v1/season/bootstrap)
+    if (path === "/fpl/bootstrap") {
+      return cacheFirstKV(request, env, kSeasonBootstrap(season));
+    }
+
+    // GET /fpl/entry/:id/summary → proxy to FPL entry summary
+    if (path.match(/^\/fpl\/entry\/\d+\/summary$/)) {
+      const entryId = Number(path.split("/")[3]);
+      if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
+
+      try {
+        const summary = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/entry/${entryId}/`
+        );
+        return json(summary, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch entry summary", details: String(err.message) }, 502);
+      }
+    }
+
+    // GET /fpl/entry/:id → proxy to entry history
+    if (path.match(/^\/fpl\/entry\/\d+$/) && !path.includes("/event/") && !path.includes("/summary") && !path.includes("/transfers")) {
+      const entryId = Number(path.split("/")[3]);
+      if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
+
+      try {
+        const history = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/entry/${entryId}/history/`
+        );
+        return json(history, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch entry history", details: String(err.message) }, 502);
+      }
+    }
+
+    // GET /fpl/entry/:id/transfers → proxy to transfers
+    if (path.match(/^\/fpl\/entry\/\d+\/transfers$/)) {
+      const entryId = Number(path.split("/")[3]);
+      if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
+
+      try {
+        const transfers = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/entry/${entryId}/transfers/`
+        );
+        return json(transfers, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch transfers", details: String(err.message) }, 502);
+      }
+    }
+
+    // GET /fpl/entry/:id/event/:gw/picks → proxy to picks
+    if (path.match(/^\/fpl\/entry\/\d+\/event\/\d+\/picks$/)) {
+      const parts = path.split("/").filter(Boolean);
+      const entryId = Number(parts[2]);
+      const gw = Number(parts[4]);
+
+      if (!Number.isInteger(entryId) || !Number.isInteger(gw)) {
+        return json({ error: "Invalid entry id or gameweek" }, 400);
+      }
+
+      try {
+        const picks = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`
+        );
+        return json(picks, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch picks", details: String(err.message) }, 502);
+      }
+    }
+
+    // GET /fpl/live/:gw → proxy to live gameweek data
+    if (path.match(/^\/fpl\/live\/\d+$/)) {
+      const gw = Number(path.split("/")[3]);
+      if (!Number.isInteger(gw)) return json({ error: "Invalid gameweek" }, 400);
+
+      try {
+        const live = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/event/${gw}/live/`
+        );
+        return json(live, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch live data", details: String(err.message) }, 502);
+      }
+    }
+
+    // GET /fpl/league/:id → proxy to FPL league standings
+    if (path.match(/^\/fpl\/league\/\d+$/)) {
+      const leagueId = path.split("/")[3];
+      try {
+        const standings = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/leagues-classic/${leagueId}/standings/?page_standings=1`
+        );
+        return json(standings, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch league standings", details: String(err.message) }, 502);
+      }
+    }
+
+    // GET /fpl/element-summary/:id → proxy to player history
+    if (path.match(/^\/fpl\/element-summary\/\d+$/)) {
+      const playerId = Number(path.split("/")[3]);
+      if (!Number.isInteger(playerId)) return json({ error: "Invalid player id" }, 400);
+
+      try {
+        const playerHistory = await fetchJsonWithRetry(
+          `https://fantasy.premierleague.com/api/element-summary/${playerId}/`
+        );
+        return json(playerHistory, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      } catch (err) {
+        return json({ error: "Failed to fetch player history", details: String(err.message) }, 502);
+      }
     }
 
     // === Admin endpoints (Phase 3 scaffold; all require REFRESH_TOKEN) ===
@@ -677,6 +1101,33 @@ export default {
           members_count: uniqueMembers.length,
           queued_count: queuedCount
         }, 200);
+      }
+
+      // POST /admin/entry/:entryId/force-rebuild
+      // Force a full rebuild of a single entry blob, even if already complete
+      if (path.startsWith("/admin/entry/") && path.endsWith("/force-rebuild")) {
+        const parts = path.split("/").filter(Boolean); // ["admin","entry",":id","force-rebuild"]
+        const entryId = Number(parts[2]);
+        if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
+
+        const seasonNum = Number(env.SEASON || 2025);
+        const stateKey = kEntryState(entryId, seasonNum);
+        const seasonKey = kEntrySeason(entryId, seasonNum);
+
+        // Read any existing state (if present)
+        const existingState = await kvGetJSON(env.FPL_PULSE_KV, stateKey);
+
+        // Always set to queued, resetting last_gw_processed to 0 so we rebuild from scratch
+        await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+          status: "queued",
+          last_gw_processed: 0,
+          updated_at: new Date().toISOString(),
+          version: (existingState?.version ?? 0) + 1,
+        });
+
+        // Optionally keep or overwrite the old blob; processEntryOnce will overwrite anyway
+        const result = await processEntryOnce(entryId, seasonNum, env.FPL_PULSE_KV);
+        return json({ ok: !!result.ok, mode: "force-rebuild", result }, result.ok ? 200 : 207);
       }
 
       // POST /admin/entry/:entryId/enqueue
