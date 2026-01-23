@@ -144,7 +144,7 @@ const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues
 const circuitBreaker = {
   failures: 0,
   openUntil: 0,
-  maxFailures: 5,
+  maxFailures: 15,
   resetTimeout: 15 * 60 * 1000, // 15 minutes
 
   isOpen() {
@@ -205,7 +205,7 @@ async function fetchJsonWithRetry(url, tries = 3, baseDelay = 200) {
       }
 
       if (!res.ok) {
-        circuitBreaker.recordFailure();
+        if (res.status !== 404) circuitBreaker.recordFailure();
         throw new Error(`HTTP ${res.status} for ${url}`);
       }
 
@@ -318,9 +318,10 @@ async function processEntryOnce(entryId, season, kv) {
       ? Math.min(existingBlob.last_gw_processed + 1, targetGW)
       : 1;
 
-    // Only fetch GWs we don't already have
+    // Only fetch picks for GWs the entry participated in (present in history)
     for (let gw = startGW; gw <= targetGW; gw++) {
       if (picks_by_gw[gw]) continue; // Skip if we already have this GW
+      if (!gw_summaries[gw]) continue; // Skip GWs the entry didn't play (mid-season join)
 
       const p = await fetchJsonWithRetry(
         `https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`
@@ -341,6 +342,7 @@ async function processEntryOnce(entryId, season, kv) {
     if (existingBlob && startGW > 1) {
       for (let gw = 1; gw < startGW; gw++) {
         if (picks_by_gw[gw]) continue; // Skip if we already have this GW
+        if (!gw_summaries[gw]) continue; // Skip GWs the entry didn't play
 
         const p = await fetchJsonWithRetry(
           `https://fantasy.premierleague.com/api/entry/${entryId}/event/${gw}/picks/`
