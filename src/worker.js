@@ -609,6 +609,76 @@ async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   return { status: "ok", last_gw: prevId };
 }
 
+// === Auto-retry errored entries ===
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
+
+async function retryErroredEntries(env) {
+  const season = Number(env.SEASON || 2025);
+  const candidates = [];
+  let cursor;
+
+  // Scan for entry state keys
+  do {
+    const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor, limit: 100 });
+    cursor = page.cursor;
+    for (const k of page.keys) {
+      if (k.name.endsWith(`:${season}:state`)) {
+        const id = Number(k.name.split(":")[1]);
+        if (Number.isInteger(id)) candidates.push(id);
+      }
+    }
+    if (candidates.length >= 200) break;
+  } while (cursor);
+
+  // Find errored entries: either retryable or ready for dead letter
+  const retryable = [];
+  let deadLettered = 0;
+
+  for (const id of candidates) {
+    const state = await kvGetJSON(env.FPL_PULSE_KV, kEntryState(id, season));
+    if (!state || state.status !== "errored") continue;
+
+    // Entries that have exhausted retries → mark dead
+    if ((state.attempts || 0) >= MAX_RETRY_ATTEMPTS) {
+      await kvPutJSON(env.FPL_PULSE_KV, kEntryState(id, season), {
+        status: "dead",
+        error: state.error || "max retries exhausted",
+        attempts: state.attempts,
+        updated_at: new Date().toISOString(),
+      });
+      deadLettered++;
+      continue;
+    }
+
+    const erroredAt = state.updated_at ? Date.parse(state.updated_at) : 0;
+    if ((Date.now() - erroredAt) < RETRY_COOLDOWN_MS) continue;
+
+    retryable.push({ id, attempts: state.attempts || 0 });
+  }
+
+  // Re-queue and process (max 5 per cron cycle to stay within time budget)
+  const batch = retryable.slice(0, 5);
+  let succeeded = 0;
+
+  for (const { id, attempts } of batch) {
+    await kvPutJSON(env.FPL_PULSE_KV, kEntryState(id, season), {
+      status: "queued",
+      last_gw_processed: 0,
+      attempts,
+      updated_at: new Date().toISOString(),
+    });
+
+    const result = await processEntryOnce(id, season, env.FPL_PULSE_KV);
+    if (result.ok) succeeded++;
+  }
+
+  if (batch.length || deadLettered) {
+    console.log(`Auto-retry: ${succeeded}/${batch.length} succeeded, ${deadLettered} dead-lettered`);
+  }
+  return { retried: batch.length, succeeded, eligible: retryable.length };
+}
+
 // === Phase 7: cache warm helper ===
 async function warmCache(env) {
   const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
@@ -684,6 +754,7 @@ export default {
         let queuedCount = 0;
         let buildingCount = 0;
         let completeCount = 0;
+        let deadCount = 0;
 
         let cursor;
         do {
@@ -697,11 +768,12 @@ export default {
               else if (state?.status === "queued") queuedCount++;
               else if (state?.status === "building") buildingCount++;
               else if (state?.status === "complete") completeCount++;
+              else if (state?.status === "dead") deadCount++;
             }
           }
 
           // Limit scan to prevent timeout
-          if (erroredCount + queuedCount + buildingCount + completeCount > 200) break;
+          if (erroredCount + queuedCount + buildingCount + completeCount + deadCount > 200) break;
         } while (cursor);
 
         // Detect active GW
@@ -730,7 +802,8 @@ export default {
             queued: queuedCount,
             building: buildingCount,
             complete: completeCount,
-            total: erroredCount + queuedCount + buildingCount + completeCount,
+            dead: deadCount,
+            total: erroredCount + queuedCount + buildingCount + completeCount + deadCount,
           },
           circuit_breaker: {
             is_open: circuitBreaker.isOpen(),
@@ -1211,6 +1284,43 @@ export default {
         return json(res, 200);
       }
 
+      // POST /admin/circuit-breaker/reset
+      if (path === "/admin/circuit-breaker/reset") {
+        const prev = { failures: circuitBreaker.failures, openUntil: circuitBreaker.openUntil };
+        circuitBreaker.reset();
+        return json({ ok: true, previous: prev }, 200);
+      }
+
+      // POST /admin/dead/revive — re-queue all dead entries (resets attempts to 0)
+      // If entries fail again, they follow the normal flow: errored → 3 retries → dead
+      if (path === "/admin/dead/revive") {
+        const seasonNum = Number(env.SEASON || 2025);
+        const revived = [];
+        let cursor;
+
+        do {
+          const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor, limit: 100 });
+          cursor = page.cursor;
+          for (const k of page.keys) {
+            if (!k.name.endsWith(`:${seasonNum}:state`)) continue;
+            const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
+            if (state?.status !== "dead") continue;
+
+            const entryId = Number(k.name.split(":")[1]);
+            await kvPutJSON(env.FPL_PULSE_KV, k.name, {
+              status: "queued",
+              last_gw_processed: 0,
+              attempts: 0,
+              updated_at: new Date().toISOString(),
+            });
+            revived.push(entryId);
+          }
+          if (revived.length >= 200) break;
+        } while (cursor);
+
+        return json({ ok: true, revived_count: revived.length, entry_ids: revived }, 200);
+      }
+
       // POST /admin/backfill?single=true&entry=<id>
       // Minimal one-entry backfill for testing
       // POST /admin/backfill
@@ -1324,6 +1434,9 @@ export default {
       } catch {}
       try {
         await harvestIfNeeded(env);
+      } catch {}
+      try {
+        await retryErroredEntries(env);
       } catch {}
     })());
   },

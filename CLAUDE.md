@@ -8,14 +8,14 @@ Single Cloudflare Worker (`src/worker.js`, ~1,327 lines) with:
 - **Data flow:** FPL API → Worker → KV → Edge Cache → Client
 - **Storage:** Cloudflare KV (`FPL_PULSE_KV` binding)
 - **Schedule:** Hourly cron triggers harvest of all entries
-- **Config:** `wrangler.toml` (v0.9, season 2025, league 852082)
+- **Config:** `wrangler.toml` (v0.10, season 2025, league 852082)
 
 ## KV Key Schema
 
 ```
 season:<year>:bootstrap           # Game metadata + player info
 entry:<id>:<season>               # Full season blob (picks, history, transfers)
-entry:<id>:<season>:state         # State machine: queued|building|complete|errored
+entry:<id>:<season>:state         # State machine: queued|building|complete|errored|dead
 league:<id>:members               # Array of entry IDs
 snapshot:current                  # Last processed GW info
 heartbeat:<iso-timestamp>         # Cron liveness marker
@@ -26,7 +26,10 @@ heartbeat:<iso-timestamp>         # Cron liveness marker
 ```
 queued → building → complete    (success)
 queued → building → errored     (failure)
-errored → queued                (manual retry)
+errored → queued                (auto-retry after 1h, max 3 attempts)
+errored → dead                  (after 3 failed attempts)
+dead → queued                   (manual revive via /admin/dead/revive)
+errored → queued                (manual retry via admin)
 building → queued               (60-min timeout reset)
 ```
 
@@ -36,7 +39,7 @@ building → queued               (60-min timeout reset)
 |-------|---------|
 | 1-50 | Utilities: CORS, response helpers, cache helpers, `dynamicCacheHeaders()` |
 | 50-140 | KV helpers, key builders, `MAX_LEAGUE_SIZE = 50` |
-| 142-180 | Circuit breaker (5 failures, 15-min reset) |
+| 142-180 | Circuit breaker (15 failures, 15-min reset) |
 | 182-230 | `fetchJsonWithRetry()` with 429/503 handling |
 | 230-410 | `processEntryOnce()` — smart partial backfill |
 | 410-540 | `updateEntryForGW()` — conditional transfer/summary refresh |
@@ -53,23 +56,23 @@ building → queued               (60-min timeout reset)
 
 **Dynamic cache:** Read bootstrap to check if current GW is active (`is_current && !finished`). Active: 6h s-maxage. Finished: 7d s-maxage.
 
-**Circuit breaker:** In-memory counter. Opens at 5 failures, blocks fetches for 15 min. Decrements on success. Resets on worker restart.
+**Circuit breaker:** In-memory counter. Opens at 15 failures, blocks fetches for 15 min. Decrements on success. 404s excluded. Resets on worker restart.
+
+**Auto-retry:** Hourly cron re-queues errored entries after 1h cooldown, max 3 attempts, 5 per cycle.
 
 ## Known Limitations
 
 1. Circuit breaker resets on worker restart (stateless, acceptable at current scale)
 2. `/health/detailed` scans first 200 entry states only
 3. Dynamic cache requires bootstrap KV read per entry request (edge-cached)
-4. No auto-retry for errored entries
-5. Season hardcoded in `wrangler.toml` — no automatic rollover
-6. No deduplication of concurrent admin requests
+4. Season hardcoded in `wrangler.toml` — no automatic rollover
+5. No deduplication of concurrent admin requests
 
 ## Future Enhancements
 
-- Auto-retry errored entries after 24h cooldown
 - Structured JSON logging for log aggregation
-- Admin endpoint to reset circuit breaker
-- Dead letter queue for permanently failed entries
+- Admin endpoint to view/manage entry states in bulk
+- Admin endpoint to view dead entry error details
 - KV blob compression (gzip) if blobs grow large
 - Split into read/write/cron workers at scale
 - Durable Objects for atomic state transitions
