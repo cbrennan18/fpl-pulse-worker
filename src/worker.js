@@ -55,6 +55,52 @@ async function kvPutJSON(kv, key, value) {
   return kv.put(key, JSON.stringify(value));
 }
 
+// === Structured JSON Logger ===
+// Outputs JSON logs for log aggregation (Cloudflare Logpush, Workers Analytics)
+function structuredLog(level, component, event, data = {}) {
+  const entry = {
+    timestamp: new Date().toISOString(),
+    level,
+    component,
+    event,
+    ...data,
+  };
+  const output = JSON.stringify(entry);
+  if (level === "error") console.error(output);
+  else if (level === "warn") console.warn(output);
+  else console.log(output);
+}
+
+const log = {
+  debug: (component, event, data) => structuredLog("debug", component, event, data),
+  info: (component, event, data) => structuredLog("info", component, event, data),
+  warn: (component, event, data) => structuredLog("warn", component, event, data),
+  error: (component, event, data) => structuredLog("error", component, event, data),
+};
+
+// === Idempotency helpers ===
+const kIdempotency = (key) => `idempotency:${key}`;
+const IDEMPOTENCY_TTL = 3600; // 1 hour
+
+async function checkIdempotencyKey(env, key) {
+  if (!key) return null;
+  const cached = await kvGetJSON(env.FPL_PULSE_KV, kIdempotency(key));
+  return cached;
+}
+
+async function storeIdempotencyResult(env, key, result, status) {
+  if (!key) return;
+  await env.FPL_PULSE_KV.put(
+    kIdempotency(key),
+    JSON.stringify({
+      result,
+      status,
+      completed_at: new Date().toISOString(),
+    }),
+    { expirationTtl: IDEMPOTENCY_TTL }
+  );
+}
+
 // === Key builders (Phase 1 data model) ===
 // These functions generate consistent KV keys for each object we store
 const kSeasonBootstrap = (season) => `season:${season}:bootstrap`;
@@ -63,6 +109,8 @@ const kSnapshotCurrent = `snapshot:current`;
 const kLeagueMembers   = (leagueId) => `league:${leagueId}:members`;
 const kEntrySeason     = (entryId, season) => `entry:${entryId}:${season}`;
 const kEntryState      = (entryId, season) => `entry:${entryId}:${season}:state`;
+const kHealthStateSummary = `health:state_summary`;
+const kDetectedSeason = `config:detected_season`;
 
 // === Minimal schema guards ===
 // These ensure the blobs we read back from KV are valid JSON objects
@@ -162,7 +210,11 @@ const circuitBreaker = {
     this.failures++;
     if (this.failures >= this.maxFailures) {
       this.openUntil = Date.now() + this.resetTimeout;
-      console.error(`Circuit breaker OPEN - FPL API failures: ${this.failures}, waiting ${this.resetTimeout / 60000}min`);
+      log.error("circuit_breaker", "open", {
+        failures: this.failures,
+        reset_timeout_min: this.resetTimeout / 60000,
+        open_until: new Date(this.openUntil).toISOString(),
+      });
     }
   },
 
@@ -173,9 +225,10 @@ const circuitBreaker = {
   },
 
   reset() {
+    const prevFailures = this.failures;
     this.failures = 0;
     this.openUntil = 0;
-    console.log('Circuit breaker RESET - FPL API recovered');
+    log.info("circuit_breaker", "reset", { previous_failures: prevFailures });
   }
 };
 
@@ -197,7 +250,13 @@ async function fetchJsonWithRetry(url, tries = 3, baseDelay = 200) {
       if (res.status === 429 || res.status === 503) {
         const retryAfter = res.headers.get("Retry-After");
         const waitMs = retryAfter ? parseInt(retryAfter) * 1000 : Math.min(baseDelay * Math.pow(2, i + 2), 10000);
-        console.warn(`Rate limited or service unavailable (${res.status}) for ${url}, waiting ${waitMs}ms`);
+        log.warn("fpl_api", "rate_limited", {
+          status: res.status,
+          url,
+          wait_ms: waitMs,
+          retry_attempt: i + 1,
+          max_retries: tries,
+        });
         circuitBreaker.recordFailure();
         if (i < tries - 1) await sleep(waitMs);
         lastErr = new Error(`HTTP ${res.status} for ${url}`);
@@ -253,12 +312,19 @@ async function processEntryOnce(entryId, season, kv) {
   }
 
   // Mark building
+  const newAttempts = (state.attempts || 0) + 1;
   await kvPutJSON(kv, stateKey, {
     status: "building",
     last_gw_processed: state.last_gw_processed ?? 0,
     worker_started_at: nowIso,
-    attempts: (state.attempts || 0) + 1,
+    attempts: newAttempts,
     updated_at: nowIso,
+  });
+  log.info("entry", "state_transition", {
+    entry_id: entryId,
+    from: state.status,
+    to: "building",
+    attempts: newAttempts,
   });
 
   try {
@@ -382,25 +448,103 @@ async function processEntryOnce(entryId, season, kv) {
       status: "complete",
       last_gw_processed: targetGW,
       updated_at: new Date().toISOString(),
-      attempts: (state.attempts || 0) + 1,
+      attempts: newAttempts,
+    });
+    log.info("entry", "state_transition", {
+      entry_id: entryId,
+      from: "building",
+      to: "complete",
+      target_gw: targetGW,
     });
 
     return { ok: true, entryId, targetGW };
   } catch (err) {
     // Mark errored (non-fatal for the worker)
+    const errorMsg = String(err?.message || err);
     await kvPutJSON(kv, stateKey, {
       status: "errored",
-      error: String(err?.message || err),
+      error: errorMsg,
       updated_at: new Date().toISOString(),
-      attempts: (state?.attempts || 0) + 1,
+      attempts: newAttempts,
     });
-    return { ok: false, reason: "error", entryId, error: String(err?.message || err) };
+    log.warn("entry", "state_transition", {
+      entry_id: entryId,
+      from: "building",
+      to: "errored",
+      error: errorMsg,
+      attempts: newAttempts,
+    });
+    return { ok: false, reason: "error", entryId, error: errorMsg };
   }
 }
 
 // === Phase 6: harvest helpers ===
 async function fetchBootstrap() {
   return fetchJsonWithRetry("https://fantasy.premierleague.com/api/bootstrap-static/");
+}
+
+// === Season auto-detection ===
+// Detect current season from FPL API bootstrap-static
+async function detectSeasonFromAPI(env) {
+  const cached = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
+
+  // Return cached if fresh (< 1 hour)
+  if (cached && cached.detected_at) {
+    const ageMs = Date.now() - Date.parse(cached.detected_at);
+    if (ageMs < 3600 * 1000) {
+      return cached.season;
+    }
+  }
+
+  try {
+    const bootstrap = await fetchBootstrap();
+
+    // FPL API events contain deadline_time like "2024-08-16T17:30:00Z"
+    // The season is the year the season STARTS (Aug-May spans two calendar years)
+    const firstEvent = bootstrap?.events?.[0];
+    if (firstEvent?.deadline_time) {
+      const deadline = new Date(firstEvent.deadline_time);
+      const year = deadline.getFullYear();
+      // If deadline is Aug-Dec, season is that year
+      // If deadline is Jan-Jul, season is previous year (shouldn't happen for event 1)
+      const month = deadline.getMonth(); // 0-indexed
+      const detectedSeason = month >= 7 ? year : year - 1; // Aug=7
+
+      // Cache the result
+      await kvPutJSON(env.FPL_PULSE_KV, kDetectedSeason, {
+        season: detectedSeason,
+        detected_at: new Date().toISOString(),
+        source: "fpl_api",
+        first_event_deadline: firstEvent.deadline_time,
+      });
+
+      log.info("season", "detected", { season: detectedSeason, source: "fpl_api" });
+      return detectedSeason;
+    }
+  } catch (err) {
+    log.warn("season", "detection_failed", { error: String(err?.message || err) });
+  }
+
+  // Fallback to null (caller should use env.SEASON)
+  return null;
+}
+
+// Get effective season: try cache first, then auto-detect, then fall back to env
+async function getEffectiveSeason(env) {
+  // Quick cache check first (avoids API call on every request)
+  const cached = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
+  if (cached && cached.season && cached.detected_at) {
+    const ageMs = Date.now() - Date.parse(cached.detected_at);
+    if (ageMs < 3600 * 1000) {
+      return cached.season;
+    }
+  }
+
+  // Try detection (will also update cache)
+  const detected = await detectSeasonFromAPI(env);
+  if (detected) return detected;
+
+  return Number(env.SEASON || 2025);
 }
 
 function detectLatestFinishedGW(bootstrap) {
@@ -503,10 +647,10 @@ async function updateEntryForGW(env, season, entryId, gw) {
         changed = true;
       }
     } catch (err) {
-      console.warn(
-        `Failed to refresh transfers for entry ${entryId}:`,
-        String(err?.message || err)
-      );
+      log.warn("harvest", "transfer_refresh_failed", {
+        entry_id: entryId,
+        error: String(err?.message || err),
+      });
     }
   }
 
@@ -527,10 +671,10 @@ async function updateEntryForGW(env, season, entryId, gw) {
       blob.summary_last_refreshed_at = new Date().toISOString();
       changed = true; // small blob; fine to treat as changed
     } catch (err) {
-      console.warn(
-        `Failed to refresh summary for entry ${entryId}:`,
-        String(err?.message || err)
-      );
+      log.warn("harvest", "summary_refresh_failed", {
+        entry_id: entryId,
+        error: String(err?.message || err),
+      });
     }
   }
 
@@ -548,7 +692,7 @@ async function updateSnapshot(env, season, gw) {
 }
 
 async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
-  const season = Number(env.SEASON || 2025);
+  const season = await getEffectiveSeason(env);
   const t0 = Date.now();
 
   const bootstrap = await fetchBootstrap();
@@ -590,7 +734,11 @@ async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   // Now process entries in batches with time budget
   for (const id of allEntryIds) {
     if ((Date.now() - t0) > 25_000) {
-      console.warn(`Harvest timeout approaching, processed ${processedCount}/${allEntryIds.length} entries`);
+      log.warn("harvest", "timeout_approaching", {
+        processed: processedCount,
+        total: allEntryIds.length,
+        elapsed_ms: Date.now() - t0,
+      });
       break;
     }
 
@@ -603,10 +751,47 @@ async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
 
   if (pending.length) await Promise.all(pending);
 
-  console.log(`Harvest completed: ${processedCount}/${allEntryIds.length} entries updated in ${Date.now() - t0}ms`);
+  log.info("harvest", "completed", {
+    processed: processedCount,
+    total: allEntryIds.length,
+    elapsed_ms: Date.now() - t0,
+    gw: prevId,
+  });
 
   await updateSnapshot(env, season, prevId);
   return { status: "ok", last_gw: prevId };
+}
+
+// === Update precomputed health state summary ===
+async function updateHealthStateSummary(env) {
+  const season = await getEffectiveSeason(env);
+  const counts = { queued: 0, building: 0, complete: 0, errored: 0, dead: 0 };
+  let cursor;
+
+  do {
+    const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor, limit: 100 });
+    cursor = page.cursor;
+
+    for (const k of page.keys) {
+      if (!k.name.endsWith(`:${season}:state`)) continue;
+      const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
+      if (state?.status && Object.prototype.hasOwnProperty.call(counts, state.status)) {
+        counts[state.status]++;
+      }
+    }
+  } while (cursor);
+
+  const summary = {
+    ...counts,
+    total: Object.values(counts).reduce((a, b) => a + b, 0),
+    updated_at: new Date().toISOString(),
+    season,
+  };
+
+  await kvPutJSON(env.FPL_PULSE_KV, kHealthStateSummary, summary);
+  log.info("health", "summary_updated", summary);
+
+  return summary;
 }
 
 // === Auto-retry errored entries ===
@@ -614,7 +799,7 @@ const MAX_RETRY_ATTEMPTS = 3;
 const RETRY_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
 async function retryErroredEntries(env) {
-  const season = Number(env.SEASON || 2025);
+  const season = await getEffectiveSeason(env);
   const candidates = [];
   let cursor;
 
@@ -647,6 +832,13 @@ async function retryErroredEntries(env) {
         attempts: state.attempts,
         updated_at: new Date().toISOString(),
       });
+      log.warn("entry", "state_transition", {
+        entry_id: id,
+        from: "errored",
+        to: "dead",
+        attempts: state.attempts,
+        error: state.error || "max retries exhausted",
+      });
       deadLettered++;
       continue;
     }
@@ -674,7 +866,12 @@ async function retryErroredEntries(env) {
   }
 
   if (batch.length || deadLettered) {
-    console.log(`Auto-retry: ${succeeded}/${batch.length} succeeded, ${deadLettered} dead-lettered`);
+    log.info("retry", "batch_complete", {
+      succeeded,
+      attempted: batch.length,
+      dead_lettered: deadLettered,
+      eligible_remaining: retryable.length - batch.length,
+    });
   }
   return { retried: batch.length, succeeded, eligible: retryable.length };
 }
@@ -682,7 +879,7 @@ async function retryErroredEntries(env) {
 // === Phase 7: cache warm helper ===
 async function warmCache(env) {
   const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
-  const season = Number(env.SEASON || 2025);
+  const season = await getEffectiveSeason(env);
   const cache = caches.default;
   const warmed = [];
 
@@ -730,7 +927,19 @@ export default {
 
     const url = new URL(request.url);
     const path = url.pathname;
-    const season = Number(env.SEASON || 2025);
+
+    // Quick season resolution with cache-first (no API call on every request)
+    let season;
+    const cachedSeason = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
+    if (cachedSeason && cachedSeason.season && cachedSeason.detected_at) {
+      const ageMs = Date.now() - Date.parse(cachedSeason.detected_at);
+      if (ageMs < 3600 * 1000) {
+        season = cachedSeason.season;
+      }
+    }
+    if (!season) {
+      season = Number(env.SEASON || 2025); // Fallback, cron will update cache
+    }
 
     // Health check endpoint
     if (path === "/health") {
@@ -749,32 +958,53 @@ export default {
         const snapshot = await kvGetJSON(env.FPL_PULSE_KV, kSnapshotCurrent);
         const bootstrap = await kvGetJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season));
 
-        // Count errored entries
-        let erroredCount = 0;
-        let queuedCount = 0;
-        let buildingCount = 0;
-        let completeCount = 0;
-        let deadCount = 0;
+        // Read precomputed state summary (updated by cron)
+        const stateSummary = await kvGetJSON(env.FPL_PULSE_KV, kHealthStateSummary);
 
-        let cursor;
-        do {
-          const page = await env.FPL_PULSE_KV.list({ prefix: `entry:`, cursor, limit: 100 });
-          cursor = page.cursor;
-
-          for (const k of page.keys) {
-            if (k.name.endsWith(`:${season}:state`)) {
-              const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
-              if (state?.status === "errored") erroredCount++;
-              else if (state?.status === "queued") queuedCount++;
-              else if (state?.status === "building") buildingCount++;
-              else if (state?.status === "complete") completeCount++;
-              else if (state?.status === "dead") deadCount++;
+        // Use precomputed summary if available and matches current season
+        let entryCounts;
+        if (stateSummary && stateSummary.season === season) {
+          entryCounts = {
+            errored: stateSummary.errored,
+            queued: stateSummary.queued,
+            building: stateSummary.building,
+            complete: stateSummary.complete,
+            dead: stateSummary.dead,
+            total: stateSummary.total,
+            source: "precomputed",
+            summary_age_sec: Math.floor((Date.now() - Date.parse(stateSummary.updated_at)) / 1000),
+          };
+        } else {
+          // Fallback: limited scan (original behavior for first deploy)
+          let erroredCount = 0, queuedCount = 0, buildingCount = 0, completeCount = 0, deadCount = 0;
+          let cursor;
+          do {
+            const page = await env.FPL_PULSE_KV.list({ prefix: `entry:`, cursor, limit: 100 });
+            cursor = page.cursor;
+            for (const k of page.keys) {
+              if (k.name.endsWith(`:${season}:state`)) {
+                const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
+                if (state?.status === "errored") erroredCount++;
+                else if (state?.status === "queued") queuedCount++;
+                else if (state?.status === "building") buildingCount++;
+                else if (state?.status === "complete") completeCount++;
+                else if (state?.status === "dead") deadCount++;
+              }
             }
-          }
+            if (erroredCount + queuedCount + buildingCount + completeCount + deadCount > 200) break;
+          } while (cursor);
 
-          // Limit scan to prevent timeout
-          if (erroredCount + queuedCount + buildingCount + completeCount + deadCount > 200) break;
-        } while (cursor);
+          entryCounts = {
+            errored: erroredCount,
+            queued: queuedCount,
+            building: buildingCount,
+            complete: completeCount,
+            dead: deadCount,
+            total: erroredCount + queuedCount + buildingCount + completeCount + deadCount,
+            source: "scan_limited",
+            scan_limit: 200,
+          };
+        }
 
         // Detect active GW
         const activeGW = bootstrap?.events?.find(e => e?.is_current === true && e?.finished === false);
@@ -797,14 +1027,7 @@ export default {
             active_name: activeGW ? activeGW.name : null,
             is_finished: activeGW ? activeGW.finished : null,
           },
-          entries: {
-            errored: erroredCount,
-            queued: queuedCount,
-            building: buildingCount,
-            complete: completeCount,
-            dead: deadCount,
-            total: erroredCount + queuedCount + buildingCount + completeCount + deadCount,
-          },
+          entries: entryCounts,
           circuit_breaker: {
             is_open: circuitBreaker.isOpen(),
             failures: circuitBreaker.failures,
@@ -1087,8 +1310,278 @@ export default {
 
     // === Admin endpoints (Phase 3 scaffold; all require REFRESH_TOKEN) ===
     if (path.startsWith("/admin/")) {
-      if (request.method !== "POST") return json({ error: "Method not allowed" }, 405);
+      // Allow GET for specific read-only admin endpoints
+      const isGetAllowed = path === "/admin/entries/states" || path === "/admin/entries/dead";
+      if (request.method !== "POST" && !(request.method === "GET" && isGetAllowed)) {
+        return json({ error: "Method not allowed" }, 405);
+      }
       if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
+
+      // Check for idempotency key (for POST requests only)
+      const idempotencyKey = request.method === "POST" ? request.headers.get("X-Idempotency-Key") : null;
+      if (idempotencyKey) {
+        const cached = await checkIdempotencyKey(env, idempotencyKey);
+        if (cached) {
+          log.info("admin", "idempotency_cache_hit", {
+            key: idempotencyKey,
+            path,
+            original_completed_at: cached.completed_at
+          });
+          return json(
+            { ...cached.result, _idempotency: { cached: true, original_completed_at: cached.completed_at } },
+            cached.status,
+            { "X-Idempotency-Cached": "true" }
+          );
+        }
+      }
+
+      // GET /admin/entries/states — List all entry states with pagination and filtering
+      if (path === "/admin/entries/states" && request.method === "GET") {
+        log.info("admin", "endpoint_invoked", { path, method: "GET" });
+
+        const u = new URL(request.url);
+        const statusFilter = u.searchParams.get("status"); // queued|building|complete|errored|dead
+        const cursorParam = u.searchParams.get("cursor"); // base64-encoded cursor
+        const limitParam = Math.min(100, Math.max(1, Number(u.searchParams.get("limit") || 50)));
+
+        const validStatuses = ["queued", "building", "complete", "errored", "dead"];
+        if (statusFilter && !validStatuses.includes(statusFilter)) {
+          return json({ error: "Invalid status filter", valid: validStatuses }, 400);
+        }
+
+        // Decode cursor
+        let kvCursor = cursorParam ? atob(cursorParam) : undefined;
+
+        const entries = [];
+        let scannedKeys = 0;
+        const maxScan = 500; // Safety limit per request
+
+        do {
+          const page = await env.FPL_PULSE_KV.list({
+            prefix: "entry:",
+            cursor: kvCursor,
+            limit: 100
+          });
+          kvCursor = page.cursor;
+
+          for (const k of page.keys) {
+            if (!k.name.endsWith(`:${season}:state`)) continue;
+            scannedKeys++;
+
+            const entryId = Number(k.name.split(":")[1]);
+            if (!Number.isInteger(entryId)) continue;
+
+            const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
+            if (!state) continue;
+
+            // Apply status filter
+            if (statusFilter && state.status !== statusFilter) continue;
+
+            entries.push({
+              entry_id: entryId,
+              status: state.status,
+              attempts: state.attempts || 0,
+              error: state.error || null,
+              last_gw_processed: state.last_gw_processed || 0,
+              updated_at: state.updated_at || null,
+            });
+
+            if (entries.length >= limitParam) break;
+          }
+
+          if (entries.length >= limitParam || scannedKeys >= maxScan) break;
+        } while (kvCursor);
+
+        // Build next cursor
+        const nextCursor = kvCursor ? btoa(kvCursor) : null;
+
+        return json({
+          entries,
+          pagination: {
+            count: entries.length,
+            limit: limitParam,
+            next_cursor: nextCursor,
+            has_more: !!nextCursor,
+          },
+          filter: {
+            status: statusFilter || "all",
+            season,
+          },
+        });
+      }
+
+      // GET /admin/entries/dead — List all dead entries with error details
+      if (path === "/admin/entries/dead" && request.method === "GET") {
+        log.info("admin", "endpoint_invoked", { path, method: "GET" });
+
+        const deadEntries = [];
+        let cursor;
+
+        do {
+          const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor, limit: 100 });
+          cursor = page.cursor;
+
+          for (const k of page.keys) {
+            if (!k.name.endsWith(`:${season}:state`)) continue;
+
+            const entryId = Number(k.name.split(":")[1]);
+            if (!Number.isInteger(entryId)) continue;
+
+            const state = await kvGetJSON(env.FPL_PULSE_KV, k.name);
+            if (state?.status !== "dead") continue;
+
+            deadEntries.push({
+              entry_id: entryId,
+              error: state.error || "Unknown error",
+              attempts: state.attempts || 0,
+              updated_at: state.updated_at || null,
+              last_gw_processed: state.last_gw_processed || 0,
+            });
+          }
+
+          // Cap at 500 to prevent timeout
+          if (deadEntries.length >= 500) break;
+        } while (cursor);
+
+        return json({
+          count: deadEntries.length,
+          entries: deadEntries,
+          season,
+        });
+      }
+
+      // POST /admin/entries/states/bulk — Bulk actions on entries
+      if (path === "/admin/entries/states/bulk" && request.method === "POST") {
+        log.info("admin", "endpoint_invoked", { path, method: "POST" });
+
+        let body;
+        try {
+          body = await request.json();
+        } catch {
+          return json({ error: "Invalid JSON body" }, 400);
+        }
+
+        const { action, entry_ids } = body;
+        const validActions = ["requeue", "purge"];
+
+        if (!action || !validActions.includes(action)) {
+          return json({ error: "Invalid action", valid: validActions }, 400);
+        }
+        if (!Array.isArray(entry_ids) || entry_ids.length === 0) {
+          return json({ error: "entry_ids must be a non-empty array" }, 400);
+        }
+        if (entry_ids.length > 100) {
+          return json({ error: "Maximum 100 entries per bulk operation" }, 400);
+        }
+
+        const results = { succeeded: [], failed: [] };
+
+        for (const entryId of entry_ids) {
+          const id = Number(entryId);
+          if (!Number.isInteger(id)) {
+            results.failed.push({ entry_id: entryId, reason: "invalid_id" });
+            continue;
+          }
+
+          const stateKey = kEntryState(id, season);
+
+          try {
+            if (action === "requeue") {
+              const existingState = await kvGetJSON(env.FPL_PULSE_KV, stateKey);
+              await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+                status: "queued",
+                last_gw_processed: existingState?.last_gw_processed || 0,
+                attempts: 0,
+                updated_at: new Date().toISOString(),
+              });
+              log.info("admin", "bulk_requeue", { entry_id: id });
+              results.succeeded.push(id);
+            } else if (action === "purge") {
+              // Delete both state and season blob
+              const seasonKey = kEntrySeason(id, season);
+              await Promise.all([
+                env.FPL_PULSE_KV.delete(stateKey),
+                env.FPL_PULSE_KV.delete(seasonKey),
+              ]);
+              log.info("admin", "bulk_purge", { entry_id: id });
+              results.succeeded.push(id);
+            }
+          } catch (err) {
+            results.failed.push({ entry_id: id, reason: String(err?.message || err) });
+          }
+        }
+
+        const bulkResult = {
+          ok: results.failed.length === 0,
+          action,
+          results,
+          summary: {
+            total: entry_ids.length,
+            succeeded: results.succeeded.length,
+            failed: results.failed.length,
+          },
+        };
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, bulkResult, 200);
+        }
+        return json(bulkResult);
+      }
+
+      // POST /admin/entries/:entryId/revive — Revive a single dead/errored entry
+      if (path.match(/^\/admin\/entries\/\d+\/revive$/) && request.method === "POST") {
+        const parts = path.split("/").filter(Boolean);
+        const entryId = Number(parts[2]);
+
+        log.info("admin", "endpoint_invoked", { path, method: "POST", entry_id: entryId });
+
+        if (!Number.isInteger(entryId)) {
+          return json({ error: "Invalid entry id" }, 400);
+        }
+
+        const stateKey = kEntryState(entryId, season);
+        const state = await kvGetJSON(env.FPL_PULSE_KV, stateKey);
+
+        if (!state) {
+          return json({ error: "Entry state not found", entry_id: entryId }, 404);
+        }
+
+        if (state.status !== "dead" && state.status !== "errored") {
+          return json({
+            error: "Entry is not dead or errored",
+            current_status: state.status,
+            entry_id: entryId
+          }, 400);
+        }
+
+        const previousState = { ...state };
+
+        await kvPutJSON(env.FPL_PULSE_KV, stateKey, {
+          status: "queued",
+          last_gw_processed: state.last_gw_processed || 0,
+          attempts: 0,
+          updated_at: new Date().toISOString(),
+          revived_at: new Date().toISOString(),
+          previous_error: state.error,
+        });
+
+        log.info("admin", "entry_revived", {
+          entry_id: entryId,
+          previous_status: previousState.status,
+          previous_attempts: previousState.attempts,
+        });
+
+        const reviveResult = {
+          ok: true,
+          entry_id: entryId,
+          previous_status: previousState.status,
+          previous_error: previousState.error,
+          new_status: "queued",
+        };
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, reviveResult, 200);
+        }
+        return json(reviveResult);
+      }
 
       // POST /admin/league/:leagueId/ingest  (Phase 4)
       if (path.startsWith("/admin/league/") && path.endsWith("/ingest")) {
@@ -1170,12 +1663,16 @@ export default {
           queuedCount += 1;
         }));
 
-        return json({
+        const ingestResult = {
           ok: true,
           leagueId,
           members_count: uniqueMembers.length,
           queued_count: queuedCount
-        }, 200);
+        };
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, ingestResult, 200);
+        }
+        return json(ingestResult, 200);
       }
 
       // POST /admin/entry/:entryId/force-rebuild
@@ -1213,10 +1710,18 @@ export default {
           const cacheKey = cacheKeyFor(new Request(cacheUrl));
           await caches.default.delete(cacheKey);
         } catch (e) {
-          console.warn('Failed to purge cache:', e);
+          log.warn("cache", "purge_failed", {
+            entry_id: entryId,
+            error: e?.message || String(e),
+          });
         }
 
-        return json({ ok: !!result.ok, mode: "force-rebuild", result }, result.ok ? 200 : 207);
+        const rebuildResult = { ok: !!result.ok, mode: "force-rebuild", result };
+        const rebuildStatus = result.ok ? 200 : 207;
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, rebuildResult, rebuildStatus);
+        }
+        return json(rebuildResult, rebuildStatus);
       }
 
       // POST /admin/entry/:entryId/purge-cache
@@ -1268,7 +1773,11 @@ export default {
           version: (existingState?.version ?? 0) + 1,
         });
 
-        return json({ ok: true, status: "queued", entryId }, 200);
+        const enqueueResult = { ok: true, status: "queued", entryId };
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, enqueueResult, 200);
+        }
+        return json(enqueueResult, 200);
       }
 
       // POST /admin/harvest?delay=1800
@@ -1318,7 +1827,11 @@ export default {
           if (revived.length >= 200) break;
         } while (cursor);
 
-        return json({ ok: true, revived_count: revived.length, entry_ids: revived }, 200);
+        const deadReviveResult = { ok: true, revived_count: revived.length, entry_ids: revived };
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, deadReviveResult, 200);
+        }
+        return json(deadReviveResult, 200);
       }
 
       // POST /admin/backfill?single=true&entry=<id>
@@ -1351,7 +1864,12 @@ export default {
             });
           }
           const result = await processEntryOnce(entryId, season, env.FPL_PULSE_KV);
-          return json({ ok: !!result.ok, mode: "single", result }, result.ok ? 200 : 207);
+          const singleResult = { ok: !!result.ok, mode: "single", result };
+          const singleStatus = result.ok ? 200 : 207;
+          if (idempotencyKey) {
+            await storeIdempotencyResult(env, idempotencyKey, singleResult, singleStatus);
+          }
+          return json(singleResult, singleStatus);
         }
 
         // --- batch mode ---
@@ -1404,7 +1922,7 @@ export default {
           results.push(r);
         }
 
-        const summary = {
+        const batchSummary = {
           ok: true,
           mode: "batch",
           leagueId: leagueId || null,
@@ -1414,7 +1932,10 @@ export default {
           errored: results.filter(r => !r.ok).length,
           ids: queued,
         };
-        return json(summary, 200);
+        if (idempotencyKey) {
+          await storeIdempotencyResult(env, idempotencyKey, batchSummary, 200);
+        }
+        return json(batchSummary, 200);
       }
 
       return json({ error: "Admin route not found" }, 404);
@@ -1437,6 +1958,9 @@ export default {
       } catch {}
       try {
         await retryErroredEntries(env);
+      } catch {}
+      try {
+        await updateHealthStateSummary(env);
       } catch {}
     })());
   },
