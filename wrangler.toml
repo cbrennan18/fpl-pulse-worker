@@ -3,7 +3,7 @@ main = "src/worker.js"
 compatibility_date = "2025-08-01"
 
 [vars]
-APP_VERSION = "v0.11"
+APP_VERSION = "v1.0"
 SEASON = "2025"
 # REFRESH_TOKEN is a secret; set via wrangler secret put and .dev.vars
 WARM_LEAGUE_ID = "852082"

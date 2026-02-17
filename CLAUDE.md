@@ -4,12 +4,50 @@ Project context for AI-assisted development on the FPL Pulse Worker.
 
 ## Architecture
 
-Single Cloudflare Worker (`src/worker.js`, ~1,950 lines) with:
+Cloudflare Worker split into layered ES modules:
+
+```
+worker.js (entry point)
+  ├── routes/public.js  ──┐
+  ├── routes/admin.js   ──┤
+  │                       ├── services/entry.js   ──┐
+  │                       ├── services/harvest.js ──┤
+  │                       │                        ├── lib/kv.js
+  │                       │                        ├── lib/fpl-api.js
+  │                       │                        └── lib/utils.js
+  │                       └────────────────────────────┘
+```
+
 - **Data flow:** FPL API → Worker → KV → Edge Cache → Client
 - **Storage:** Cloudflare KV (`FPL_PULSE_KV` binding)
 - **Schedule:** Hourly cron triggers harvest of all entries
 - **Config:** `wrangler.toml` (v0.11, league 852082)
 - **Logging:** Structured JSON logging for log aggregation
+- **Tests:** Vitest (`npx vitest run`)
+
+## File Structure
+
+```
+src/
+├── worker.js              # Entry point: CORS, season resolution, route dispatch, cron
+├── routes/
+│   ├── public.js          # /health, /v1/*, /fpl/* proxy routes
+│   └── admin.js           # /admin/* endpoints (auth, idempotency, CRUD)
+├── services/
+│   ├── entry.js           # processEntryOnce, retryErroredEntries, updateHealthStateSummary
+│   └── harvest.js         # Season detection, GW detection, harvest, warmCache
+└── lib/
+    ├── kv.js              # KV helpers, key builders, schema guards, cacheFirstKV
+    ├── fpl-api.js         # Circuit breaker, fetchJson, fetchJsonWithRetry, fetchBootstrap
+    └── utils.js           # CORS, json/text responses, cache headers, logger, idempotency
+test/
+├── helpers/mocks.js       # Shared KV mock + fetch mock factories
+├── circuit-breaker.test.js
+├── schema-guards.test.js
+├── entry-processor.test.js
+├── season.test.js
+└── retry.test.js
+```
 
 ## KV Key Schema
 
@@ -80,6 +118,14 @@ All require authentication via `?token=<REFRESH_TOKEN>` or `X-Refresh-Token` hea
 **Health state precomputation:** `/health/detailed` uses precomputed state counts (updated hourly by cron) to avoid timeout on large datasets.
 
 **Idempotency:** Admin POST endpoints check `X-Idempotency-Key` header. Cached results are returned for duplicate requests within 1h.
+
+## Commands
+
+```bash
+npx vitest run          # Run test suite (70 tests)
+npx wrangler dev        # Local development server
+npx wrangler deploy     # Deploy to Cloudflare
+```
 
 ## Known Limitations
 
