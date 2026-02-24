@@ -432,6 +432,24 @@ export async function handleAdminRoute(request, env, season) {
     return json(rebuildResult, rebuildStatus);
   }
 
+  // POST /admin/league/:leagueId/purge-cache
+  // Purge edge cache for a league's entries-pack endpoint
+  if (path.startsWith("/admin/league/") && path.endsWith("/purge-cache")) {
+    const parts = path.split("/").filter(Boolean); // ["admin","league",":id","purge-cache"]
+    const leagueId = parts[2];
+    if (!leagueId) return json({ error: "Missing league id" }, 400);
+
+    try {
+      const reqUrl = new URL(request.url);
+      const cacheUrl = `${reqUrl.protocol}//${reqUrl.host}/v1/league/${leagueId}/entries-pack`;
+      const cacheKey = cacheKeyFor(new Request(cacheUrl));
+      const deleted = await caches.default.delete(cacheKey);
+      return json({ ok: true, deleted, league_id: leagueId, purged_url: cacheUrl });
+    } catch (e) {
+      return json({ ok: false, error: e.message }, 500);
+    }
+  }
+
   // POST /admin/entry/:entryId/purge-cache
   // Purge edge cache for a specific entry
   if (path.startsWith("/admin/entry/") && path.endsWith("/purge-cache")) {

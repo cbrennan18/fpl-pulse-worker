@@ -302,6 +302,7 @@ export async function warmCache(env) {
 
   for (const url of globals) {
     const req = new Request(url);
+    await cache.delete(req);
     const resp = await fetch(req);
     if (resp.ok) await cache.put(req, resp.clone());
     warmed.push(url);
@@ -316,14 +317,17 @@ export async function warmCache(env) {
       for (const id of slice) {
         const u = `${base}/v1/entry/${id}`;
         const req = new Request(u);
+        await cache.delete(req);
         const resp = await fetch(req);
         if (resp.ok) await cache.put(req, resp.clone());
         warmed.push(u);
       }
-      const pack = `${base}/v1/league/${LEAGUE_ID}/entries-pack`;
-      const r = await fetch(pack);
-      if (r.ok) await cache.put(new Request(pack), r.clone());
-      warmed.push(pack);
+      const packUrl = `${base}/v1/league/${LEAGUE_ID}/entries-pack`;
+      const packReq = new Request(packUrl);
+      await cache.delete(packReq);
+      const r = await fetch(packReq);
+      if (r.ok) await cache.put(packReq, r.clone());
+      warmed.push(packUrl);
     }
   }
 
