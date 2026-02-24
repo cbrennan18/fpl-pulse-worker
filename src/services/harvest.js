@@ -114,6 +114,8 @@ export async function updateEntryForGW(env, season, entryId, gw) {
         value: Number(row.value ?? 0),
         bank: Number(row.bank ?? 0),
         chip: row?.chip || null,
+        event_transfers: Number(row.event_transfers ?? 0),
+        event_transfers_cost: Number(row.event_transfers_cost ?? 0),
       };
       changed = true;
     }
@@ -128,9 +130,11 @@ export async function updateEntryForGW(env, season, entryId, gw) {
     const arr = Array.isArray(picks?.picks) ? picks.picks : [];
     blob.picks_by_gw[gw] = {
       active_chip: picks?.active_chip ?? null,
+      points_on_bench: Number(picks?.entry_history?.points_on_bench ?? 0),
       picks: arr.map(px => ({
         element: Number(px?.element ?? 0),
         position: Number(px?.position ?? 0),
+        multiplier: Number(px?.multiplier ?? 0),
         is_captain: Boolean(px?.is_captain),
         is_vice: Boolean(px?.is_vice_captain || px?.is_vice),
       })),

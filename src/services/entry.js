@@ -79,6 +79,8 @@ export async function processEntryOnce(entryId, season, kv) {
         value: Number(row.value ?? 0), // FPL returns x10; keep as-is for now
         bank: Number(row.bank ?? 0),   // x10; keep as-is
         chip: row?.chip || null,
+        event_transfers: Number(row.event_transfers ?? 0),
+        event_transfers_cost: Number(row.event_transfers_cost ?? 0),
       };
     }
     if (targetGW <= 0) throw new Error("no_target_gw");
@@ -119,9 +121,11 @@ export async function processEntryOnce(entryId, season, kv) {
       const picksArr = Array.isArray(p?.picks) ? p.picks : [];
       picks_by_gw[gw] = {
         active_chip: p?.active_chip ?? null,
+        points_on_bench: Number(p?.entry_history?.points_on_bench ?? 0),
         picks: picksArr.map(px => ({
           element: Number(px?.element ?? 0),
           position: Number(px?.position ?? 0),
+          multiplier: Number(px?.multiplier ?? 0),
           is_captain: Boolean(px?.is_captain),
           is_vice: Boolean(px?.is_vice_captain || px?.is_vice),
         })),
@@ -140,9 +144,11 @@ export async function processEntryOnce(entryId, season, kv) {
         const picksArr = Array.isArray(p?.picks) ? p.picks : [];
         picks_by_gw[gw] = {
           active_chip: p?.active_chip ?? null,
+          points_on_bench: Number(p?.entry_history?.points_on_bench ?? 0),
           picks: picksArr.map(px => ({
             element: Number(px?.element ?? 0),
             position: Number(px?.position ?? 0),
+            multiplier: Number(px?.multiplier ?? 0),
             is_captain: Boolean(px?.is_captain),
             is_vice: Boolean(px?.is_vice_captain || px?.is_vice),
           })),
