@@ -1,8 +1,59 @@
 import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult } from '../lib/utils.js';
-import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { fetchJson, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
 import { harvestIfNeeded, warmCache } from '../services/harvest.js';
+
+// === KV audit helpers ===
+
+// Categorize a raw KV key name into a known type
+function categorizeKey(keyName, currentSeason) {
+  if (keyName.startsWith("heartbeat:")) return { type: "heartbeat" };
+  if (keyName.startsWith("idempotency:")) return { type: "idempotency" };
+  if (keyName === "config:detected_season") return { type: "config" };
+  if (keyName === "health:state_summary") return { type: "health" };
+  if (keyName === "snapshot:current") return { type: "snapshot" };
+
+  const seasonBoot = keyName.match(/^season:(\d+):bootstrap$/);
+  if (seasonBoot) {
+    const s = Number(seasonBoot[1]);
+    return { type: "season_bootstrap", season: s, is_current: s === currentSeason };
+  }
+  const seasonElem = keyName.match(/^season:(\d+):elements$/);
+  if (seasonElem) {
+    const s = Number(seasonElem[1]);
+    return { type: "season_elements", season: s, is_current: s === currentSeason };
+  }
+
+  // entry:<id>:<season>:state must be checked before entry:<id>:<season>
+  const entryState = keyName.match(/^entry:(\d+):(\d+):state$/);
+  if (entryState) {
+    const s = Number(entryState[2]);
+    return { type: "entry_state", entry_id: Number(entryState[1]), season: s, is_current: s === currentSeason };
+  }
+  const entryBlob = keyName.match(/^entry:(\d+):(\d+)$/);
+  if (entryBlob) {
+    const s = Number(entryBlob[2]);
+    return { type: "entry_blob", entry_id: Number(entryBlob[1]), season: s, is_current: s === currentSeason };
+  }
+
+  const league = keyName.match(/^league:(\d+):members$/);
+  if (league) return { type: "league_members", league_id: Number(league[1]) };
+
+  return { type: "unknown" };
+}
+
+// List every key in the namespace (cursor-paginated, single call for <1000 keys)
+async function listAllKeys(kv) {
+  const keys = [];
+  let cursor;
+  do {
+    const page = await kv.list({ cursor, limit: 1000 });
+    cursor = page.cursor;
+    for (const k of page.keys) keys.push(k.name);
+  } while (cursor);
+  return keys;
+}
 
 // === Admin auth helper ===
 // Accepts ?token=... or X-Refresh-Token header and compares to env.REFRESH_TOKEN
@@ -20,7 +71,7 @@ export async function handleAdminRoute(request, env, season) {
   if (!path.startsWith("/admin/")) return null;
 
   // Allow GET for specific read-only admin endpoints
-  const isGetAllowed = path === "/admin/entries/states" || path === "/admin/entries/dead";
+  const isGetAllowed = path === "/admin/entries/states" || path === "/admin/entries/dead" || path === "/admin/kv/audit";
   if (request.method !== "POST" && !(request.method === "GET" && isGetAllowed)) {
     return json({ error: "Method not allowed" }, 405);
   }
@@ -157,6 +208,215 @@ export async function handleAdminRoute(request, env, season) {
       entries: deadEntries,
       season,
     });
+  }
+
+  // GET /admin/kv/audit — Full KV namespace audit with categorization and issue detection
+  if (path === "/admin/kv/audit" && request.method === "GET") {
+    log.info("admin", "endpoint_invoked", { path, method: "GET" });
+
+    // Detect current season
+    const detected = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
+    const currentSeason = detected?.season ?? Number(env.SEASON || 2025);
+
+    // Load league members for orphan detection
+    const leagueId = new URL(request.url).searchParams.get("league_id") || env.WARM_LEAGUE_ID;
+    const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId)) : null;
+    const memberSet = Array.isArray(members) ? new Set(members) : null;
+
+    // List and categorize all keys
+    const allKeys = await listAllKeys(env.FPL_PULSE_KV);
+    const categories = {};
+    const oldSeasonKeys = [];
+    const orphanedEntries = new Map(); // entry_id -> [key names]
+    const unknownKeys = [];
+
+    for (const keyName of allKeys) {
+      const cat = categorizeKey(keyName, currentSeason);
+
+      // Aggregate counts
+      if (!categories[cat.type]) categories[cat.type] = { count: 0, current_season: 0, old_season: 0, old_seasons: [] };
+      categories[cat.type].count++;
+
+      if ("is_current" in cat) {
+        if (cat.is_current) {
+          categories[cat.type].current_season++;
+        } else {
+          categories[cat.type].old_season++;
+          if (cat.season && !categories[cat.type].old_seasons.includes(cat.season)) {
+            categories[cat.type].old_seasons.push(cat.season);
+          }
+          oldSeasonKeys.push(keyName);
+        }
+      }
+
+      // Orphan detection: current-season entries not in the league
+      if (memberSet && cat.is_current && cat.entry_id && !memberSet.has(cat.entry_id)) {
+        const existing = orphanedEntries.get(cat.entry_id) || [];
+        existing.push(keyName);
+        orphanedEntries.set(cat.entry_id, existing);
+      }
+
+      if (cat.type === "unknown") unknownKeys.push(keyName);
+    }
+
+    // Clean up categories that don't need season fields
+    for (const [, data] of Object.entries(categories)) {
+      if (data.current_season === 0 && data.old_season === 0) {
+        delete data.current_season;
+        delete data.old_season;
+        delete data.old_seasons;
+      }
+      if (data.old_seasons?.length === 0) delete data.old_seasons;
+    }
+
+    return json({
+      total_keys: allKeys.length,
+      current_season: currentSeason,
+      league_id: leagueId ? Number(leagueId) : null,
+      categories,
+      issues: {
+        old_season_keys: oldSeasonKeys,
+        orphaned_entries: [...orphanedEntries.entries()].map(([id, keys]) => ({ entry_id: id, keys })),
+        unknown_keys: unknownKeys,
+      },
+      cron_coverage: {
+        automatically_maintained: [
+          "heartbeat:* (written hourly, 1h TTL — auto-expires)",
+          "health:state_summary (overwritten hourly by updateHealthStateSummary)",
+          "season:<current>:bootstrap (updated when new GW finishes)",
+          "season:<current>:elements (updated when new GW finishes)",
+          "entry:*:<current> blobs (updated when new GW finishes)",
+          "entry:*:<current>:state (retried hourly for errored entries)",
+          "snapshot:current (updated when new GW finishes)",
+        ],
+        requires_manual_management: [
+          "league:*:members (only updated via /admin/league/:id/ingest)",
+          "config:detected_season (updated on request, 1h freshness check)",
+          "Old season keys — never cleaned up automatically",
+          "Orphaned entries (removed from league) — never cleaned up automatically",
+        ],
+      },
+    });
+  }
+
+  // POST /admin/kv/cleanup — Targeted KV cleanup with dry-run and confirm_count safeguards
+  if (path === "/admin/kv/cleanup" && request.method === "POST") {
+    log.info("admin", "endpoint_invoked", { path, method: "POST" });
+
+    let body;
+    try {
+      body = await request.json();
+    } catch {
+      return json({ error: "Invalid JSON body" }, 400);
+    }
+
+    const dryRun = body.dry_run !== false; // default true
+    const targets = body.targets;
+    const confirmCount = body.confirm_count;
+
+    const validTargets = ["old_season", "orphaned_entries"];
+    if (!Array.isArray(targets) || targets.length === 0) {
+      return json({ error: "targets must be a non-empty array", valid: validTargets }, 400);
+    }
+    for (const t of targets) {
+      if (!validTargets.includes(t)) {
+        return json({ error: `Invalid target: ${t}`, valid: validTargets }, 400);
+      }
+    }
+
+    // Detect current season
+    const detected = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
+    const currentSeason = detected?.season ?? Number(env.SEASON || 2025);
+
+    // Load league members for orphan detection
+    const leagueId = body.league_id || env.WARM_LEAGUE_ID;
+    let memberSet = null;
+    if (targets.includes("orphaned_entries")) {
+      const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId)) : null;
+      if (!Array.isArray(members)) {
+        return json({ error: "Cannot detect orphans: league members not found", league_id: leagueId }, 400);
+      }
+      memberSet = new Set(members);
+    }
+
+    // List and categorize all keys, collect deletion candidates
+    const allKeys = await listAllKeys(env.FPL_PULSE_KV);
+    const toDelete = [];
+    const wantsOldSeason = targets.includes("old_season");
+    const wantsOrphans = targets.includes("orphaned_entries");
+
+    for (const keyName of allKeys) {
+      const cat = categorizeKey(keyName, currentSeason);
+
+      // Old season: entry/season keys where is_current === false
+      if (wantsOldSeason && "is_current" in cat && !cat.is_current) {
+        toDelete.push({ key: keyName, type: cat.type, reason: "old_season", season: cat.season });
+        continue;
+      }
+
+      // Orphaned entries: current-season entry keys for IDs not in the league
+      if (wantsOrphans && memberSet && cat.entry_id && cat.is_current && !memberSet.has(cat.entry_id)) {
+        toDelete.push({ key: keyName, type: cat.type, reason: "orphaned_entry", entry_id: cat.entry_id });
+      }
+    }
+
+    // Cap at 100 deletions per request
+    const capped = toDelete.length > 100;
+    const batch = toDelete.slice(0, 100);
+
+    // Dry run — return preview
+    if (dryRun) {
+      return json({
+        ok: true,
+        dry_run: true,
+        would_delete: batch,
+        would_delete_count: batch.length,
+        capped,
+        total_candidates: toDelete.length,
+        summary: {
+          by_reason: batch.reduce((acc, d) => { acc[d.reason] = (acc[d.reason] || 0) + 1; return acc; }, {}),
+        },
+      });
+    }
+
+    // Actual deletion — require confirm_count
+    if (typeof confirmCount !== "number" || confirmCount !== batch.length) {
+      return json({
+        error: "confirm_count must match would_delete_count from dry run",
+        expected: batch.length,
+        received: confirmCount ?? null,
+      }, 409);
+    }
+
+    // Delete with inline backup: read value before deleting
+    const deleted = [];
+    const failed = [];
+    for (const item of batch) {
+      try {
+        const value = await kvGetJSON(env.FPL_PULSE_KV, item.key);
+        await env.FPL_PULSE_KV.delete(item.key);
+        log.info("admin", "kv_cleanup_delete", { key: item.key, reason: item.reason });
+        deleted.push({ ...item, backup: value });
+      } catch (err) {
+        failed.push({ key: item.key, error: String(err?.message || err) });
+      }
+    }
+
+    const cleanupResult = {
+      ok: failed.length === 0,
+      dry_run: false,
+      deleted,
+      failed,
+      summary: {
+        total_deleted: deleted.length,
+        total_failed: failed.length,
+        by_reason: deleted.reduce((acc, d) => { acc[d.reason] = (acc[d.reason] || 0) + 1; return acc; }, {}),
+      },
+    };
+    if (idempotencyKey) {
+      await storeIdempotencyResult(env, idempotencyKey, cleanupResult, 200);
+    }
+    return json(cleanupResult);
   }
 
   // POST /admin/entries/states/bulk — Bulk actions on entries

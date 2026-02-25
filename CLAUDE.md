@@ -96,6 +96,8 @@ All require authentication via `?token=<REFRESH_TOKEN>` or `X-Refresh-Token` hea
 | `/admin/dead/revive` | POST | Re-queue all dead entries |
 | `/admin/backfill?single=true&entry=N` | POST | Single entry sync test |
 | `/admin/backfill?limit=N&leagueId=L` | POST | Batch process queued entries |
+| `/admin/kv/audit` | GET | Full KV namespace audit with categorization and issue detection |
+| `/admin/kv/cleanup` | POST | Targeted KV cleanup (`{"dry_run": true, "targets": ["old_season"\|"orphaned_entries"], "confirm_count": N}`) |
 
 **Idempotency:** POST endpoints support `X-Idempotency-Key` header. Duplicate requests within 1h return cached response with `X-Idempotency-Cached: true`.
 
