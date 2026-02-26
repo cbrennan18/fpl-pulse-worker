@@ -148,6 +148,7 @@ export async function updateEntryForGW(env, season, entryId, gw) {
     ? Date.parse(blob.transfers_last_refreshed_at)
     : 0;
   const transfersStale = !blob.transfers_last_refreshed_at ||
+    isNaN(transfersLastRefreshed) ||
     (Date.now() - transfersLastRefreshed) > 6 * 3600 * 1000;
 
   if (transfersStale) {
@@ -165,12 +166,9 @@ export async function updateEntryForGW(env, season, entryId, gw) {
           }))
         : [];
 
-      const prevLen = Array.isArray(blob.transfers) ? blob.transfers.length : 0;
       blob.transfers = transfers;
       blob.transfers_last_refreshed_at = new Date().toISOString();
-      if (transfers.length !== prevLen) {
-        changed = true;
-      }
+      changed = true;
     } catch (err) {
       log.warn("harvest", "transfer_refresh_failed", {
         entry_id: entryId,
@@ -185,6 +183,7 @@ export async function updateEntryForGW(env, season, entryId, gw) {
     ? Date.parse(blob.summary_last_refreshed_at)
     : 0;
   const summaryStale = !blob.summary_last_refreshed_at ||
+    isNaN(summaryLastRefreshed) ||
     (Date.now() - summaryLastRefreshed) > 12 * 3600 * 1000;
 
   if (summaryStale) {

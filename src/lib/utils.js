@@ -3,7 +3,7 @@
 export const CORS = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, OPTIONS, HEAD, POST",
-  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Headers": "Content-Type, X-Idempotency-Key",
 };
 
 // === Response helpers ===

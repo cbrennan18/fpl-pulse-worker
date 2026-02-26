@@ -78,7 +78,7 @@ building → queued               (60-min timeout reset)
 
 ## Admin Endpoints
 
-All require authentication via `?token=<REFRESH_TOKEN>` or `X-Refresh-Token` header.
+All require authentication via `X-Refresh-Token` header.
 
 | Endpoint | Method | Purpose |
 |----------|--------|---------|

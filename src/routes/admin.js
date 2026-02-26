@@ -56,10 +56,9 @@ async function listAllKeys(kv) {
 }
 
 // === Admin auth helper ===
-// Accepts ?token=... or X-Refresh-Token header and compares to env.REFRESH_TOKEN
+// Accepts X-Refresh-Token header and compares to env.REFRESH_TOKEN
 const isAuthorized = (request, env) => {
-  const u = new URL(request.url);
-  const token = u.searchParams.get("token") || request.headers.get("x-refresh-token");
+  const token = request.headers.get("x-refresh-token");
   return Boolean(token && token === env.REFRESH_TOKEN);
 };
 
@@ -560,7 +559,7 @@ export async function handleAdminRoute(request, env, season) {
     if (!leagueIdStr) return json({ error: "Missing league id" }, 400);
     if (!Number.isInteger(leagueId) || leagueId <= 0) return json({ error: "Invalid league id" }, 400);
 
-    const seasonNum = Number(env.SEASON || 2025);
+    const seasonNum = season;
     const BASE = `https://fantasy.premierleague.com/api/leagues-classic/${leagueId}/standings/`;
 
     // Pull standings pages until we collect <= MAX_LEAGUE_SIZE entries or there are no more pages
@@ -651,7 +650,7 @@ export async function handleAdminRoute(request, env, season) {
     const entryId = Number(parts[2]);
     if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
 
-    const seasonNum = Number(env.SEASON || 2025);
+    const seasonNum = season;
     const stateKey = kEntryState(entryId, seasonNum);
 
     // Read any existing state (if present)
@@ -734,7 +733,7 @@ export async function handleAdminRoute(request, env, season) {
     const entryId = Number(parts[2]);
     if (!Number.isInteger(entryId)) return json({ error: "Invalid entry id" }, 400);
 
-    const seasonNum = Number(env.SEASON || 2025);
+    const seasonNum = season;
     const stateKey = kEntryState(entryId, seasonNum);
     const seasonKey = kEntrySeason(entryId, seasonNum);
 
@@ -789,7 +788,7 @@ export async function handleAdminRoute(request, env, season) {
   // POST /admin/dead/revive — re-queue all dead entries (resets attempts to 0)
   // If entries fail again, they follow the normal flow: errored → 3 retries → dead
   if (path === "/admin/dead/revive") {
-    const seasonNum = Number(env.SEASON || 2025);
+    const seasonNum = season;
     const revived = [];
     let cursor;
 
@@ -804,7 +803,7 @@ export async function handleAdminRoute(request, env, season) {
         const entryId = Number(k.name.split(":")[1]);
         await kvPutJSON(env.FPL_PULSE_KV, k.name, {
           status: "queued",
-          last_gw_processed: 0,
+          last_gw_processed: state.last_gw_processed ?? 0,
           attempts: 0,
           updated_at: new Date().toISOString(),
         });
@@ -828,7 +827,7 @@ export async function handleAdminRoute(request, env, season) {
   //   - batch:   /admin/backfill?limit=5[&leagueId=<id>]
   if (path === "/admin/backfill") {
     const u = new URL(request.url);
-    const seasonNum = Number(env.SEASON || 2025);
+    const seasonNum = season;
 
     // --- single mode (preserve existing) ---
     const single = u.searchParams.get("single") === "true";

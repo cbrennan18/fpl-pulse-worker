@@ -24,8 +24,8 @@ export async function processEntryOnce(entryId, season, kv) {
       state = {
         status: "queued",
         last_gw_processed: state.last_gw_processed ?? 0,
+        attempts: state.attempts ?? 0,
         updated_at: new Date().toISOString(),
-        version: (state.version ?? 0) + 1,
       };
       await kvPutJSON(kv, stateKey, state);
     }
@@ -194,6 +194,7 @@ export async function processEntryOnce(entryId, season, kv) {
     await kvPutJSON(kv, stateKey, {
       status: "errored",
       error: errorMsg,
+      last_gw_processed: state.last_gw_processed ?? 0,
       updated_at: new Date().toISOString(),
       attempts: newAttempts,
     });
@@ -243,6 +244,7 @@ export async function retryErroredEntries(env) {
       await kvPutJSON(env.FPL_PULSE_KV, kEntryState(id, season), {
         status: "dead",
         error: state.error || "max retries exhausted",
+        last_gw_processed: state.last_gw_processed ?? 0,
         attempts: state.attempts,
         updated_at: new Date().toISOString(),
       });
@@ -258,19 +260,19 @@ export async function retryErroredEntries(env) {
     }
 
     const erroredAt = state.updated_at ? Date.parse(state.updated_at) : 0;
-    if ((Date.now() - erroredAt) < RETRY_COOLDOWN_MS) continue;
+    if (!isNaN(erroredAt) && (Date.now() - erroredAt) < RETRY_COOLDOWN_MS) continue;
 
-    retryable.push({ id, attempts: state.attempts || 0 });
+    retryable.push({ id, attempts: state.attempts || 0, last_gw_processed: state.last_gw_processed ?? 0 });
   }
 
   // Re-queue and process (max 5 per cron cycle to stay within time budget)
   const batch = retryable.slice(0, 5);
   let succeeded = 0;
 
-  for (const { id, attempts } of batch) {
+  for (const { id, attempts, last_gw_processed } of batch) {
     await kvPutJSON(env.FPL_PULSE_KV, kEntryState(id, season), {
       status: "queued",
-      last_gw_processed: 0,
+      last_gw_processed,
       attempts,
       updated_at: new Date().toISOString(),
     });

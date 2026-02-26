@@ -91,8 +91,10 @@ export async function fetchJsonWithRetry(url, tries = 3, baseDelay = 200) {
       }
 
       if (!res.ok) {
-        if (res.status !== 404) circuitBreaker.recordFailure();
-        throw new Error(`HTTP ${res.status} for ${url}`);
+        const err = new Error(`HTTP ${res.status} for ${url}`);
+        err.skipCircuitBreaker = res.status === 404;
+        if (!err.skipCircuitBreaker) circuitBreaker.recordFailure();
+        throw err;
       }
 
       // Success - record it for circuit breaker
@@ -100,7 +102,7 @@ export async function fetchJsonWithRetry(url, tries = 3, baseDelay = 200) {
       return await res.json();
     } catch (err) {
       lastErr = err;
-      circuitBreaker.recordFailure();
+      if (!err.skipCircuitBreaker) circuitBreaker.recordFailure();
       if (i < tries - 1) await sleep(baseDelay * Math.pow(2, i)); // 200ms, 400ms, 800ms
     }
   }

@@ -2,7 +2,7 @@
 // Thin dispatcher: routes requests to handlers and runs scheduled cron jobs.
 // All business logic lives in services/ and lib/.
 
-import { CORS, text } from './lib/utils.js';
+import { CORS, text, log } from './lib/utils.js';
 import { kvGetJSON, kDetectedSeason } from './lib/kv.js';
 import { handlePublicRoute } from './routes/public.js';
 import { handleAdminRoute } from './routes/admin.js';
@@ -45,16 +45,24 @@ export default {
     ctx.waitUntil((async () => {
       try {
         await env.FPL_PULSE_KV.put(`heartbeat:${new Date(event.scheduledTime).toISOString()}`, "1", { expirationTtl: 3600 });
-      } catch {}
+      } catch (err) {
+        log.error("cron", "heartbeat_failed", { error: String(err?.message || err) });
+      }
       try {
         await harvestIfNeeded(env);
-      } catch {}
+      } catch (err) {
+        log.error("cron", "harvest_failed", { error: String(err?.message || err) });
+      }
       try {
         await retryErroredEntries(env);
-      } catch {}
+      } catch (err) {
+        log.error("cron", "retry_failed", { error: String(err?.message || err) });
+      }
       try {
         await updateHealthStateSummary(env);
-      } catch {}
+      } catch (err) {
+        log.error("cron", "health_summary_failed", { error: String(err?.message || err) });
+      }
     })());
   },
 };
