@@ -7,7 +7,7 @@ import { kvGetJSON, kDetectedSeason } from './lib/kv.js';
 import { handlePublicRoute } from './routes/public.js';
 import { handleAdminRoute } from './routes/admin.js';
 import { harvestIfNeeded } from './services/harvest.js';
-import { retryErroredEntries, updateHealthStateSummary } from './services/entry.js';
+import { retryErroredEntries, processQueuedEntries, updateHealthStateSummary } from './services/entry.js';
 
 export default {
   async fetch(request, env, ctx) {
@@ -52,6 +52,11 @@ export default {
         await harvestIfNeeded(env);
       } catch (err) {
         log.error("cron", "harvest_failed", { error: String(err?.message || err) });
+      }
+      try {
+        await processQueuedEntries(env);
+      } catch (err) {
+        log.error("cron", "queued_processing_failed", { error: String(err?.message || err) });
       }
       try {
         await retryErroredEntries(env);

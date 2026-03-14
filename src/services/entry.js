@@ -292,6 +292,55 @@ export async function retryErroredEntries(env) {
   return { retried: batch.length, succeeded, eligible: retryable.length };
 }
 
+// === Auto-process queued entries ===
+export const MAX_QUEUED_PER_CYCLE = 5;
+
+export async function processQueuedEntries(env) {
+  const season = await getEffectiveSeason(env);
+  const candidates = [];
+  let cursor;
+
+  // Scan for entry state keys
+  do {
+    const page = await env.FPL_PULSE_KV.list({ prefix: "entry:", cursor, limit: 100 });
+    cursor = page.cursor;
+    for (const k of page.keys) {
+      if (k.name.endsWith(`:${season}:state`)) {
+        const id = Number(k.name.split(":")[1]);
+        if (Number.isInteger(id)) candidates.push(id);
+      }
+    }
+    if (candidates.length >= 200) break;
+  } while (cursor);
+
+  // Find queued entries
+  const queued = [];
+
+  for (const id of candidates) {
+    const state = await kvGetJSON(env.FPL_PULSE_KV, kEntryState(id, season));
+    if (!state || state.status !== "queued") continue;
+    queued.push(id);
+  }
+
+  // Process (max 5 per cron cycle to stay within time budget)
+  const batch = queued.slice(0, MAX_QUEUED_PER_CYCLE);
+  let succeeded = 0;
+
+  for (const id of batch) {
+    const result = await processEntryOnce(id, season, env.FPL_PULSE_KV);
+    if (result.ok) succeeded++;
+  }
+
+  if (batch.length) {
+    log.info("queued", "batch_complete", {
+      succeeded,
+      attempted: batch.length,
+      eligible_remaining: queued.length - batch.length,
+    });
+  }
+  return { processed: batch.length, succeeded, eligible: queued.length };
+}
+
 // === Update precomputed health state summary ===
 export async function updateHealthStateSummary(env) {
   const season = await getEffectiveSeason(env);

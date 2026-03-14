@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { retryErroredEntries, updateHealthStateSummary, MAX_RETRY_ATTEMPTS, RETRY_COOLDOWN_MS } from '../src/services/entry.js';
+import { retryErroredEntries, processQueuedEntries, updateHealthStateSummary, MAX_RETRY_ATTEMPTS, MAX_QUEUED_PER_CYCLE, RETRY_COOLDOWN_MS } from '../src/services/entry.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
 import { kEntryState, kEntrySeason, kDetectedSeason, kHealthStateSummary } from '../src/lib/kv.js';
 import { createMockEnv, mockFetch } from './helpers/mocks.js';
@@ -270,5 +270,117 @@ describe('updateHealthStateSummary', () => {
     expect(stored).not.toBeNull();
     expect(stored.complete).toBe(1);
     expect(stored.total).toBe(1);
+  });
+});
+
+describe('processQueuedEntries', () => {
+  let env;
+  let cleanup;
+
+  beforeEach(async () => {
+    circuitBreaker.reset();
+    env = createMockEnv();
+    await seedSeason(env);
+  });
+
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  it('processes queued entries to completion', async () => {
+    await seedEntryState(env, 100, {
+      status: "queued",
+      last_gw_processed: 0,
+      updated_at: new Date().toISOString(),
+    });
+
+    cleanup = mockFetch({
+      'https://fantasy.premierleague.com/api/entry/100/': { id: 100 },
+      'https://fantasy.premierleague.com/api/entry/100/history/': {
+        current: [
+          { event: 1, points: 50, total_points: 50, rank: 1000, overall_rank: 500000, value: 1000, bank: 0 },
+        ],
+      },
+      'https://fantasy.premierleague.com/api/entry/100/transfers/': [],
+      'https://fantasy.premierleague.com/api/entry/100/event/1/picks/': {
+        active_chip: null,
+        picks: [{ element: 1, position: 1, is_captain: true, is_vice_captain: false }],
+      },
+    });
+
+    const result = await processQueuedEntries(env);
+    expect(result.processed).toBe(1);
+    expect(result.succeeded).toBe(1);
+
+    const state = JSON.parse(await env.FPL_PULSE_KV.get(kEntryState(100, SEASON)));
+    expect(state.status).toBe("complete");
+  });
+
+  it('skips non-queued entries', async () => {
+    await seedEntryState(env, 200, { status: "complete", last_gw_processed: 2 });
+    await seedEntryState(env, 201, { status: "errored", error: "fail", attempts: 1 });
+    await seedEntryState(env, 202, { status: "dead", error: "dead", attempts: 3 });
+
+    const result = await processQueuedEntries(env);
+    expect(result.processed).toBe(0);
+    expect(result.succeeded).toBe(0);
+    expect(result.eligible).toBe(0);
+  });
+
+  it('caps at MAX_QUEUED_PER_CYCLE', async () => {
+    // Seed 7 queued entries
+    const routes = {};
+    for (let i = 1; i <= 7; i++) {
+      const id = 300 + i;
+      await seedEntryState(env, id, {
+        status: "queued",
+        last_gw_processed: 0,
+        updated_at: new Date().toISOString(),
+      });
+      routes[`https://fantasy.premierleague.com/api/entry/${id}/`] = { id };
+      routes[`https://fantasy.premierleague.com/api/entry/${id}/history/`] = {
+        current: [{ event: 1, points: 50, total_points: 50, rank: 1000, overall_rank: 500000, value: 1000, bank: 0 }],
+      };
+      routes[`https://fantasy.premierleague.com/api/entry/${id}/transfers/`] = [];
+      routes[`https://fantasy.premierleague.com/api/entry/${id}/event/1/picks/`] = {
+        active_chip: null,
+        picks: [{ element: 1, position: 1, is_captain: true, is_vice_captain: false }],
+      };
+    }
+    cleanup = mockFetch(routes);
+
+    const result = await processQueuedEntries(env);
+    expect(result.processed).toBe(MAX_QUEUED_PER_CYCLE); // capped at 5
+    expect(result.eligible).toBe(7);
+  });
+
+  it('returns zero counts when no queued entries exist', async () => {
+    const result = await processQueuedEntries(env);
+    expect(result.processed).toBe(0);
+    expect(result.succeeded).toBe(0);
+    expect(result.eligible).toBe(0);
+  });
+
+  it('handles processing failure gracefully', async () => {
+    await seedEntryState(env, 400, {
+      status: "queued",
+      last_gw_processed: 0,
+      updated_at: new Date().toISOString(),
+    });
+
+    // Mock FPL API to return empty history (triggers "empty_history" error)
+    cleanup = mockFetch({
+      'https://fantasy.premierleague.com/api/entry/400/': { id: 400 },
+      'https://fantasy.premierleague.com/api/entry/400/history/': { current: [] },
+      'https://fantasy.premierleague.com/api/entry/400/transfers/': [],
+    });
+
+    const result = await processQueuedEntries(env);
+    expect(result.processed).toBe(1);
+    expect(result.succeeded).toBe(0);
+
+    const state = JSON.parse(await env.FPL_PULSE_KV.get(kEntryState(400, SEASON)));
+    expect(state.status).toBe("errored");
   });
 });

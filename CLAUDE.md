@@ -34,7 +34,7 @@ src/
 │   ├── public.js          # /health, /v1/*, /fpl/* proxy routes
 │   └── admin.js           # /admin/* endpoints (auth, idempotency, CRUD)
 ├── services/
-│   ├── entry.js           # processEntryOnce, retryErroredEntries, updateHealthStateSummary
+│   ├── entry.js           # processEntryOnce, processQueuedEntries, retryErroredEntries, updateHealthStateSummary
 │   └── harvest.js         # Season detection, GW detection, harvest, warmCache
 └── lib/
     ├── kv.js              # KV helpers, key builders, schema guards, cacheFirstKV
@@ -114,6 +114,8 @@ All require authentication via `X-Refresh-Token` header.
 **Dynamic cache:** Read bootstrap to check if current GW is active (`is_current && !finished`). Active: 6h s-maxage. Finished: 7d s-maxage.
 
 **Circuit breaker:** In-memory counter. Opens at 15 failures, blocks fetches for 15 min. Decrements on success. 404s excluded. Resets on worker restart.
+
+**Auto-process queued:** Hourly cron builds freshly ingested entries (max 5 per cycle) via `processQueuedEntries`.
 
 **Auto-retry:** Hourly cron re-queues errored entries after 1h cooldown, max 3 attempts, 5 per cycle.
 

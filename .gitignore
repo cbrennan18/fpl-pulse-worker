@@ -5,3 +5,4 @@ dist
 .env
 .dev.vars
 coverage
+ENDPOINT_MANUAL.md
