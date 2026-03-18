@@ -310,7 +310,7 @@ export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
     const req = new Request(url);
     await cache.delete(req);
     const resp = await fetch(req);
-    if (resp.ok) await cache.put(req, resp.clone());
+    if (resp.ok) try { await cache.put(req, resp.clone()); } catch {}
     warmed.push(url);
   }
 
@@ -358,7 +358,7 @@ export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
       const req = new Request(u);
       await cache.delete(req);
       const resp = await fetch(req);
-      if (resp.ok) await cache.put(req, resp.clone());
+      if (resp.ok) try { await cache.put(req, resp.clone()); } catch {}
       warmed.push(u);
     }
 
@@ -367,7 +367,7 @@ export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
     const packReq = new Request(packUrl);
     await cache.delete(packReq);
     const r = await fetch(packReq);
-    if (r.ok) await cache.put(packReq, r.clone());
+    if (r.ok) try { await cache.put(packReq, r.clone()); } catch {}
     warmed.push(packUrl);
   }
 
