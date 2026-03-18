@@ -20,6 +20,6 @@
   "homepage": "https://github.com/cbrennan18/fpl-pulse-worker#readme",
   "devDependencies": {
     "vitest": "^4.0.18",
-    "wrangler": "^4.33.0"
+    "wrangler": "^4.75.0"
   }
 }

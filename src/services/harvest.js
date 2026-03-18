@@ -296,8 +296,9 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
 }
 
 // === Cache warm helper ===
-// Partial completion is safe: cache.delete() runs before fetch(), so un-warmed entries
-// serve as cache misses and are repopulated on the next user request from KV.
+// Purges individual entry caches (no re-fetch) to stay within the 50 subrequest limit.
+// Purged entries repopulate from KV on first user request.
+// Only the entries-pack per league and global season endpoints are actively re-fetched.
 // timeBudgetMs: wall-clock budget before stopping early (default 25s)
 export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
   const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
@@ -342,24 +343,12 @@ export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
     const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
     if (!Array.isArray(members)) continue;
 
-    // Purge + re-warm each unique member's entry blob (reads from KV, no FPL API)
+    // Purge individual entry caches (no re-fetch — avoids subrequest limit).
+    // Individual entries repopulate from KV on first user request after purge.
     for (const id of members) {
-      if ((Date.now() - t0) > timeBudgetMs) {
-        log.warn("warm_cache", "timeout_approaching", {
-          elapsed_ms: Date.now() - t0,
-          warmed_count: warmed.length,
-        });
-        timedOut = true;
-        break outer;
-      }
       if (seenEntryIds.has(id)) continue;
       seenEntryIds.add(id);
-      const u = `${base}/v1/entry/${id}`;
-      const req = new Request(u);
-      await cache.delete(req);
-      const resp = await fetch(req);
-      if (resp.ok) try { await cache.put(req, resp.clone()); } catch {}
-      warmed.push(u);
+      await cache.delete(new Request(`${base}/v1/entry/${id}`));
     }
 
     // Purge + re-warm the league entries-pack
