@@ -20,6 +20,7 @@ export const kEntrySeason     = (entryId, season) => `entry:${entryId}:${season}
 export const kEntryState      = (entryId, season) => `entry:${entryId}:${season}:state`;
 export const kHealthStateSummary = `health:state_summary`;
 export const kDetectedSeason = `config:detected_season`;
+export const kPurgeQueue = `cache:purge_queue`;
 
 // === Minimal schema guards ===
 // These ensure the blobs we read back from KV are valid JSON objects

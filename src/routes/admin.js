@@ -2,7 +2,7 @@ import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult } f
 import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { fetchJson, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
-import { harvestIfNeeded, warmCache } from '../services/harvest.js';
+import { harvestIfNeeded, warmCache, processPurgeQueue } from '../services/harvest.js';
 
 // === KV audit helpers ===
 
@@ -772,10 +772,12 @@ export async function handleAdminRoute(request, env, season) {
     return json(res, res.status === "ok" || res.status === "noop" ? 200 : 202);
   }
 
-  // POST /admin/warm
+  // POST /admin/warm — builds purge queue then immediately processes the first batch.
+  // If queue has >45 items (PURGE_BATCH_SIZE), remaining items are cleared by subsequent CRON cycles.
   if (path === "/admin/warm") {
-    const res = await warmCache(env);
-    return json(res, 200);
+    const queueResult = await warmCache(env);
+    const purgeResult = await processPurgeQueue(env);
+    return json({ queue: queueResult, purge: purgeResult }, 200);
   }
 
   // POST /admin/circuit-breaker/reset

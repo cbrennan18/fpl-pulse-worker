@@ -6,7 +6,7 @@ import { CORS, text, log } from './lib/utils.js';
 import { kvGetJSON, kDetectedSeason } from './lib/kv.js';
 import { handlePublicRoute } from './routes/public.js';
 import { handleAdminRoute } from './routes/admin.js';
-import { harvestIfNeeded, warmCache } from './services/harvest.js';
+import { harvestIfNeeded, warmCache, processPurgeQueue } from './services/harvest.js';
 import { retryErroredEntries, processQueuedEntries, updateHealthStateSummary } from './services/entry.js';
 
 export default {
@@ -48,9 +48,16 @@ export default {
       } catch (err) {
         log.error("cron", "heartbeat_failed", { error: String(err?.message || err) });
       }
+      // Process any pending cache purge queue from a previous harvest cycle (runs every cron tick)
+      try {
+        await processPurgeQueue(env);
+      } catch (err) {
+        log.error("cron", "purge_queue_failed", { error: String(err?.message || err) });
+      }
       try {
         const harvestResult = await harvestIfNeeded(env);
         if (harvestResult.status === "ok") {
+          // warmCache builds the purge queue in KV (zero cache ops); processPurgeQueue clears it next cycle
           await warmCache(env);
         }
       } catch (err) {

@@ -1,4 +1,4 @@
-import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kDetectedSeason } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kDetectedSeason, kPurgeQueue } from '../lib/kv.js';
 import { fetchJsonWithRetry, fetchBootstrap } from '../lib/fpl-api.js';
 import { log } from '../lib/utils.js';
 
@@ -295,27 +295,37 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   return { status: "partial", processed: processedCount, total: allEntryIds.length, last_gw: prevId };
 }
 
-// === Cache warm helper ===
-// Purges individual entry caches (no re-fetch) to stay within the 50 subrequest limit.
-// Purged entries repopulate from KV on first user request.
-// Only the entries-pack per league and global season endpoints are actively re-fetched.
-// timeBudgetMs: wall-clock budget before stopping early (default 25s)
-export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
+// === Cache invalidation after harvest ===
+//
+// CONSTRAINT: On Cloudflare Workers Standard plan, ALL cache API operations
+// (cache.delete / cache.match / cache.put) AND fetch() calls count as subrequests.
+// Hard limit: 50 per Worker invocation.
+//
+// ARCHITECTURE:
+//   warmCache()         — zero cache ops. Discovers all URLs to invalidate, writes a
+//                         prioritised purge queue to KV. Returns immediately.
+//   processPurgeQueue() — runs at the START of every cron cycle. Processes up to
+//                         PURGE_BATCH_SIZE URLs per invocation (1 cache.delete each).
+//
+// PRIORITY ORDER in queue (processed first → freshest soonest):
+//   1. Global season endpoints  — used by every page
+//   2. Per-league aggregates    — entries-pack, standings, members (league page)
+//   3. Individual entry blobs   — home + pulse pages
+//
+// SCALE:
+//   Current (4 leagues, ~36 entries ≈ 51 items): clears in 2 cron cycles (≤ 2h after harvest).
+//   Up to ~8 leagues + ~100 entries: clears in 3–4 cycles.
+//   Future path for large-scale deployments: move worker to a custom Cloudflare domain,
+//   then use the Zone Cache Purge API — one fetch() call purges 30 URLs, eliminating
+//   the per-item subrequest cost entirely.
+
+const PURGE_BATCH_SIZE = 45; // leaves 5 subrequest headroom against the 50-per-invocation limit
+
+// Build and store a prioritised purge queue in KV — no cache ops, zero subrequests.
+export async function warmCache(env) {
   const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
-  const cache = caches.default;
-  const warmed = [];
-  const t0 = Date.now();
 
-  // Warm global season endpoints (always first — highest priority)
-  for (const url of [`${base}/v1/season/elements`, `${base}/v1/season/bootstrap`]) {
-    const req = new Request(url);
-    await cache.delete(req);
-    const resp = await fetch(req);
-    if (resp.ok) try { await cache.put(req, resp.clone()); } catch {}
-    warmed.push(url);
-  }
-
-  // Discover all leagues from KV and warm each one
+  // Discover all leagues from KV
   let cursor;
   const leagueIds = [];
   do {
@@ -326,39 +336,80 @@ export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
     }
   } while (cursor);
 
-  // Collect unique entry IDs across all leagues to avoid duplicate fetches
-  const seenEntryIds = new Set();
-  let timedOut = false;
-
-  outer: for (const leagueId of leagueIds) {
-    if ((Date.now() - t0) > timeBudgetMs) {
-      log.warn("warm_cache", "timeout_approaching", {
-        elapsed_ms: Date.now() - t0,
-        warmed_count: warmed.length,
-      });
-      timedOut = true;
-      break;
-    }
-
+  // Collect unique entry IDs across all leagues
+  const entryIds = new Set();
+  for (const leagueId of leagueIds) {
     const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
-    if (!Array.isArray(members)) continue;
-
-    // Purge individual entry caches (no re-fetch — avoids subrequest limit).
-    // Individual entries repopulate from KV on first user request after purge.
-    for (const id of members) {
-      if (seenEntryIds.has(id)) continue;
-      seenEntryIds.add(id);
-      await cache.delete(new Request(`${base}/v1/entry/${id}`));
-    }
-
-    // Purge + re-warm the league entries-pack
-    const packUrl = `${base}/v1/league/${leagueId}/entries-pack`;
-    const packReq = new Request(packUrl);
-    await cache.delete(packReq);
-    const r = await fetch(packReq);
-    if (r.ok) try { await cache.put(packReq, r.clone()); } catch {}
-    warmed.push(packUrl);
+    if (Array.isArray(members)) members.forEach(id => entryIds.add(id));
   }
 
-  return { status: timedOut ? "partial" : "ok", warmed, elapsed_ms: Date.now() - t0 };
+  // Build prioritised list of URLs to purge from edge cache
+  const urls = [
+    // Priority 1: global — every page depends on these
+    `${base}/v1/season/elements`,
+    `${base}/v1/season/bootstrap`,
+    `${base}/fpl/bootstrap`,
+    // Priority 2: per-league aggregates — league page
+    ...leagueIds.flatMap(id => [
+      `${base}/fpl/league/${id}`,
+      `${base}/v1/league/${id}/members`,
+      `${base}/v1/league/${id}/entries-pack`,
+    ]),
+    // Priority 3: individual entry blobs — home + pulse pages
+    ...[...entryIds].map(id => `${base}/v1/entry/${id}`),
+  ];
+
+  await kvPutJSON(env.FPL_PULSE_KV, kPurgeQueue, {
+    urls,
+    processed: 0,
+    created_at: new Date().toISOString(),
+  });
+
+  log.info("warm_cache", "queue_built", {
+    total: urls.length,
+    leagues: leagueIds.length,
+    entries: entryIds.size,
+  });
+
+  return { status: "queued", total: urls.length, leagues: leagueIds.length, entries: entryIds.size };
+}
+
+// Process the next batch of cache purges from the KV queue.
+// Each call uses up to PURGE_BATCH_SIZE subrequests (one cache.delete per URL).
+// Designed to run at the START of every cron cycle until the queue is empty.
+export async function processPurgeQueue(env) {
+  const queue = await kvGetJSON(env.FPL_PULSE_KV, kPurgeQueue);
+  if (!queue || !Array.isArray(queue.urls) || queue.processed >= queue.urls.length) {
+    if (queue) await env.FPL_PULSE_KV.delete(kPurgeQueue);
+    return { status: "noop" };
+  }
+
+  const cache = caches.default;
+  const batch = queue.urls.slice(queue.processed, queue.processed + PURGE_BATCH_SIZE);
+
+  for (const url of batch) {
+    await cache.delete(new Request(url));
+  }
+
+  const newProcessed = queue.processed + batch.length;
+  const done = newProcessed >= queue.urls.length;
+
+  if (done) {
+    await env.FPL_PULSE_KV.delete(kPurgeQueue);
+  } else {
+    await kvPutJSON(env.FPL_PULSE_KV, kPurgeQueue, { ...queue, processed: newProcessed });
+  }
+
+  log.info("warm_cache", done ? "purge_queue_done" : "purge_queue_partial", {
+    processed_this_cycle: batch.length,
+    total_processed: newProcessed,
+    total: queue.urls.length,
+  });
+
+  return {
+    status: done ? "ok" : "partial",
+    processed_this_cycle: batch.length,
+    total_processed: newProcessed,
+    total: queue.urls.length,
+  };
 }
