@@ -61,6 +61,7 @@ snapshot:current                  # Last processed GW info
 heartbeat:<iso-timestamp>         # Cron liveness marker
 health:state_summary              # Precomputed entry state counts (updated hourly by cron)
 config:detected_season            # Auto-detected season from FPL API (1h cache)
+cache:purge_queue                 # Pending edge-cache URLs to delete (queue drained by processPurgeQueue each cron cycle)
 idempotency:<key>                 # Cached admin operation results (1h TTL)
 ```
 
@@ -111,11 +112,13 @@ All require authentication via `X-Refresh-Token` header.
 
 **Smart backfill:** Read existing blob, find `last_gw_processed`, only fetch GWs after that. Also backfills any gaps in earlier GWs.
 
-**Dynamic cache:** TTL depends on GW phase. Active GW (`is_current && !finished`): 7d. Between GWs (no active GW): time until next GW's `deadline_time` from KV bootstrap. End of season: 30d. Harvest+warmCache explicitly purge the edge cache after each GW, so TTLs act as safety nets rather than primary expiry.
+**Dynamic cache:** TTL depends on GW phase. Active GW (`is_current && !finished`): 7d. Between GWs (no active GW): time until next GW's `deadline_time` from KV bootstrap. End of season: 30d. TTLs act as safety nets; the purge queue system ensures fresh data after each harvest.
 
-**Cache invalidation after harvest:** After a successful harvest (`status: "ok"`), the cron automatically calls `warmCache`, which purges and re-fetches all entry blobs and league entries-packs for every known league. Partial harvests (timeout) do not advance `snapshot:current` and do not trigger `warmCache`, so the next cron cycle retries. Both harvest and warmCache have 25-second time budgets.
+**Cache invalidation after harvest (queue-based):** After a successful harvest (`status: "ok"`), the cron calls `warmCache`, which does **zero** cache operations — it only builds a prioritised URL list and writes it to `cache:purge_queue` in KV. Then `processPurgeQueue` (which also runs at the **start** of every cron cycle) drains the queue in batches of 45 `cache.delete()` calls, staying well under Cloudflare's 50-subrequest limit. Priority order: globals (`/v1/season/elements`, `/v1/season/bootstrap`, `/fpl/bootstrap`) → per-league (`/fpl/league/:id`, `/v1/league/:id/members`, `/v1/league/:id/entries-pack`) → individual entries (`/v1/entry/:id`). A large queue completes across successive cron cycles.
 
-**warmCache discovers leagues dynamically:** Scans KV for all `league:*:members` keys — no config needed when adding new leagues. Deduplicates entry fetches across leagues. Partial completion (timeout) is safe: `cache.delete()` runs before `fetch()`, so un-warmed entries serve as cache misses and are repopulated from KV on the next user request.
+**warmCache discovers leagues dynamically:** Scans KV for all `league:*:members` keys — no config needed when adding new leagues. Deduplicates entry IDs across leagues. `/fpl/league/:id` standings are edge-cached (explicit `cache.put()`) so they are purgeable by `processPurgeQueue`.
+
+**Subrequest budget:** Cloudflare Standard plan: 50 subrequests per invocation. `cache.delete()`, `cache.match()`, `cache.put()`, and `fetch()` all count. KV operations do **not**. `PURGE_BATCH_SIZE = 45` leaves 5 headroom.
 
 **Circuit breaker:** In-memory counter. Opens at 15 failures, blocks fetches for 15 min. Decrements on success. 404s excluded. Resets on worker restart.
 

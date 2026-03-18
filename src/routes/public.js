@@ -346,14 +346,25 @@ export async function handlePublicRoute(request, env, season) {
     }
   }
 
-  // GET /fpl/league/:id → proxy to FPL league standings
+  // GET /fpl/league/:id → proxy to FPL league standings (edge-cached so warmCache can purge it)
   if (path.match(/^\/fpl\/league\/\d+$/)) {
     const leagueId = path.split("/")[3];
+    const cache = caches.default;
+    const ck = cacheKeyFor(request);
+    const edge = await cache.match(ck);
+    if (edge) {
+      const r = new Response(edge.body, edge);
+      r.headers.set("X-Cache", "HIT");
+      r.headers.set("X-App-Version", env.APP_VERSION || "dev");
+      return r;
+    }
     try {
       const standings = await fetchJsonWithRetry(
         `https://fantasy.premierleague.com/api/leagues-classic/${leagueId}/standings/?page_standings=1`
       );
-      return json(standings, 200, { ...cacheHeaders(), ...CORS, "X-App-Version": env.APP_VERSION || "dev" });
+      const resp = json(standings, 200, { ...cacheHeaders(), ...CORS, "X-Cache": "MISS", "X-App-Version": env.APP_VERSION || "dev" });
+      try { await cache.put(ck, resp.clone()); } catch {}
+      return resp;
     } catch (err) {
       return json({ error: "Failed to fetch league standings", details: String(err.message) }, 502);
     }
