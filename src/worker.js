@@ -6,7 +6,7 @@ import { CORS, text, log } from './lib/utils.js';
 import { kvGetJSON, kDetectedSeason } from './lib/kv.js';
 import { handlePublicRoute } from './routes/public.js';
 import { handleAdminRoute } from './routes/admin.js';
-import { harvestIfNeeded } from './services/harvest.js';
+import { harvestIfNeeded, warmCache } from './services/harvest.js';
 import { retryErroredEntries, processQueuedEntries, updateHealthStateSummary } from './services/entry.js';
 
 export default {
@@ -49,7 +49,10 @@ export default {
         log.error("cron", "heartbeat_failed", { error: String(err?.message || err) });
       }
       try {
-        await harvestIfNeeded(env);
+        const harvestResult = await harvestIfNeeded(env);
+        if (harvestResult.status === "ok") {
+          await warmCache(env);
+        }
       } catch (err) {
         log.error("cron", "harvest_failed", { error: String(err?.message || err) });
       }

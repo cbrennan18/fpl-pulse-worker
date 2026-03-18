@@ -111,7 +111,11 @@ All require authentication via `X-Refresh-Token` header.
 
 **Smart backfill:** Read existing blob, find `last_gw_processed`, only fetch GWs after that. Also backfills any gaps in earlier GWs.
 
-**Dynamic cache:** Read bootstrap to check if current GW is active (`is_current && !finished`). Active: 6h s-maxage. Finished: 7d s-maxage.
+**Dynamic cache:** TTL depends on GW phase. Active GW (`is_current && !finished`): 7d. Between GWs (no active GW): time until next GW's `deadline_time` from KV bootstrap. End of season: 30d. Harvest+warmCache explicitly purge the edge cache after each GW, so TTLs act as safety nets rather than primary expiry.
+
+**Cache invalidation after harvest:** After a successful harvest (`status: "ok"`), the cron automatically calls `warmCache`, which purges and re-fetches all entry blobs and league entries-packs for every known league. Partial harvests (timeout) do not advance `snapshot:current` and do not trigger `warmCache`, so the next cron cycle retries. Both harvest and warmCache have 25-second time budgets.
+
+**warmCache discovers leagues dynamically:** Scans KV for all `league:*:members` keys — no config needed when adding new leagues. Deduplicates entry fetches across leagues. Partial completion (timeout) is safe: `cache.delete()` runs before `fetch()`, so un-warmed entries serve as cache misses and are repopulated from KV on the next user request.
 
 **Circuit breaker:** In-memory counter. Opens at 15 failures, blocks fetches for 15 min. Decrements on success. 404s excluded. Resets on worker restart.
 
@@ -126,7 +130,7 @@ All require authentication via `X-Refresh-Token` header.
 ## Commands
 
 ```bash
-npx vitest run          # Run test suite (70 tests)
+npx vitest run          # Run test suite (75 tests)
 npx wrangler dev        # Local development server
 npx wrangler deploy     # Deploy to Cloudflare
 ```

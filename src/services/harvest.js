@@ -256,6 +256,7 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   } while (cursor);
 
   // Now process entries in batches with time budget
+  let timedOut = false;
   for (const id of allEntryIds) {
     if ((Date.now() - t0) > 25_000) {
       log.warn("harvest", "timeout_approaching", {
@@ -263,6 +264,7 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
         total: allEntryIds.length,
         elapsed_ms: Date.now() - t0,
       });
+      timedOut = true;
       break;
     }
 
@@ -275,31 +277,36 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
 
   if (pending.length) await Promise.all(pending);
 
-  log.info("harvest", "completed", {
+  log.info("harvest", timedOut ? "partial" : "completed", {
     processed: processedCount,
     total: allEntryIds.length,
     elapsed_ms: Date.now() - t0,
     gw: prevId,
   });
 
-  await updateSnapshot(env, season, prevId);
-  return { status: "ok", last_gw: prevId };
+  // Only advance the snapshot if all entries were processed.
+  // A partial harvest leaves KV in a mixed state — do not cache or mark as done,
+  // so the next cron cycle will retry the remaining entries.
+  if (!timedOut) {
+    await updateSnapshot(env, season, prevId);
+    return { status: "ok", last_gw: prevId };
+  }
+
+  return { status: "partial", processed: processedCount, total: allEntryIds.length, last_gw: prevId };
 }
 
 // === Cache warm helper ===
-export async function warmCache(env) {
+// Partial completion is safe: cache.delete() runs before fetch(), so un-warmed entries
+// serve as cache misses and are repopulated on the next user request from KV.
+// timeBudgetMs: wall-clock budget before stopping early (default 25s)
+export async function warmCache(env, { timeBudgetMs = 25_000 } = {}) {
   const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
-  const season = await getEffectiveSeason(env);
   const cache = caches.default;
   const warmed = [];
+  const t0 = Date.now();
 
-  // Warm global endpoints
-  const globals = [
-    `${base}/v1/season/elements`,
-    `${base}/v1/season/bootstrap`
-  ];
-
-  for (const url of globals) {
+  // Warm global season endpoints (always first — highest priority)
+  for (const url of [`${base}/v1/season/elements`, `${base}/v1/season/bootstrap`]) {
     const req = new Request(url);
     await cache.delete(req);
     const resp = await fetch(req);
@@ -307,28 +314,62 @@ export async function warmCache(env) {
     warmed.push(url);
   }
 
-  // Warm top league entries (optional)
-  const LEAGUE_ID = env.WARM_LEAGUE_ID || null; // optional env var
-  if (LEAGUE_ID) {
-    const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(LEAGUE_ID));
-    if (Array.isArray(members)) {
-      const slice = members.slice(0, 10);
-      for (const id of slice) {
-        const u = `${base}/v1/entry/${id}`;
-        const req = new Request(u);
-        await cache.delete(req);
-        const resp = await fetch(req);
-        if (resp.ok) await cache.put(req, resp.clone());
-        warmed.push(u);
-      }
-      const packUrl = `${base}/v1/league/${LEAGUE_ID}/entries-pack`;
-      const packReq = new Request(packUrl);
-      await cache.delete(packReq);
-      const r = await fetch(packReq);
-      if (r.ok) await cache.put(packReq, r.clone());
-      warmed.push(packUrl);
+  // Discover all leagues from KV and warm each one
+  let cursor;
+  const leagueIds = [];
+  do {
+    const page = await env.FPL_PULSE_KV.list({ prefix: "league:", cursor, limit: 100 });
+    cursor = page.cursor;
+    for (const k of page.keys) {
+      if (k.name.endsWith(":members")) leagueIds.push(k.name.split(":")[1]);
     }
+  } while (cursor);
+
+  // Collect unique entry IDs across all leagues to avoid duplicate fetches
+  const seenEntryIds = new Set();
+  let timedOut = false;
+
+  outer: for (const leagueId of leagueIds) {
+    if ((Date.now() - t0) > timeBudgetMs) {
+      log.warn("warm_cache", "timeout_approaching", {
+        elapsed_ms: Date.now() - t0,
+        warmed_count: warmed.length,
+      });
+      timedOut = true;
+      break;
+    }
+
+    const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
+    if (!Array.isArray(members)) continue;
+
+    // Purge + re-warm each unique member's entry blob (reads from KV, no FPL API)
+    for (const id of members) {
+      if ((Date.now() - t0) > timeBudgetMs) {
+        log.warn("warm_cache", "timeout_approaching", {
+          elapsed_ms: Date.now() - t0,
+          warmed_count: warmed.length,
+        });
+        timedOut = true;
+        break outer;
+      }
+      if (seenEntryIds.has(id)) continue;
+      seenEntryIds.add(id);
+      const u = `${base}/v1/entry/${id}`;
+      const req = new Request(u);
+      await cache.delete(req);
+      const resp = await fetch(req);
+      if (resp.ok) await cache.put(req, resp.clone());
+      warmed.push(u);
+    }
+
+    // Purge + re-warm the league entries-pack
+    const packUrl = `${base}/v1/league/${leagueId}/entries-pack`;
+    const packReq = new Request(packUrl);
+    await cache.delete(packReq);
+    const r = await fetch(packReq);
+    if (r.ok) await cache.put(packReq, r.clone());
+    warmed.push(packUrl);
   }
 
-  return { status: "ok", warmed };
+  return { status: timedOut ? "partial" : "ok", warmed, elapsed_ms: Date.now() - t0 };
 }

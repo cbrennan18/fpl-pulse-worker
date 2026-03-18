@@ -29,20 +29,33 @@ export const cacheHeaders = (ttl = 604800, swr = 86400) => ({
 });
 
 // Dynamic cache TTL based on gameweek state
-// Returns shorter TTL during active GW, longer for finished GWs
+// Active GW: 7 days (data won't change until harvest runs; warmCache will explicitly purge)
+// Between GWs: time until next GW deadline (aligns with FPL calendar)
+// End of season: 30 days
 export const dynamicCacheHeaders = (bootstrap = null) => {
-  if (!bootstrap?.events) return cacheHeaders(); // Default 7 days
+  if (!bootstrap?.events) return cacheHeaders(7 * 24 * 3600, 3600); // safe fallback
 
-  // Check if there's an active (ongoing) gameweek
+  // Active GW (matches being played): long cache — data is stable until harvest runs
   const activeGW = bootstrap.events.find(e => e?.is_current === true && e?.finished === false);
-
   if (activeGW) {
-    // Active GW: use shorter cache (6 hours) for fresher data
-    return cacheHeaders(6 * 3600, 3600); // 6h cache, 1h SWR
+    return cacheHeaders(7 * 24 * 3600, 24 * 3600); // 7 days
   }
 
-  // No active GW: use standard long cache (7 days)
-  return cacheHeaders(); // 7 days
+  // Between GWs: TTL = time until next GW's deadline
+  const now = Date.now();
+  const nextGW = bootstrap.events
+    .filter(e => e?.deadline_time && Date.parse(e.deadline_time) > now && !e.finished)
+    .sort((a, b) => Date.parse(a.deadline_time) - Date.parse(b.deadline_time))[0];
+
+  if (nextGW?.deadline_time) {
+    const secUntilDeadline = Math.floor((Date.parse(nextGW.deadline_time) - now) / 1000);
+    const ttl = Math.max(3600, secUntilDeadline);         // min 1h
+    const swr = Math.min(3600, Math.floor(ttl * 0.1));    // 10% SWR, max 1h
+    return cacheHeaders(ttl, swr);
+  }
+
+  // End of season / no future GWs
+  return cacheHeaders(30 * 24 * 3600, 24 * 3600); // 30 days
 };
 
 // === Structured JSON Logger ===
