@@ -27,6 +27,13 @@ export const kPurgeQueue = `cache:purge_queue`;
 export const isSeasonElements = (x) =>
   x && typeof x === "object" && typeof x.last_gw_processed === "number" && x.gws && typeof x.gws === "object";
 
+// A single GW's elements block is valid only when it carries a non-empty
+// elements[] array (the canonical event/{gw}/live shape). Guards against legacy
+// or partial blocks stored under an older schema (e.g. keyed by element id),
+// which read as a zero-point gameweek to clients instead of an error.
+export const isValidGwElements = (block) =>
+  block && typeof block === "object" && Array.isArray(block.elements) && block.elements.length > 0;
+
 export const isEntrySeason = (x) =>
   x && typeof x === "object" &&
   typeof x.entry_id === "number" &&

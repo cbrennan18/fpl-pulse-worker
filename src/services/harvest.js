@@ -1,4 +1,4 @@
-import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kDetectedSeason, kPurgeQueue } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kDetectedSeason, kPurgeQueue, isValidGwElements } from '../lib/kv.js';
 import { fetchJsonWithRetry, fetchBootstrap } from '../lib/fpl-api.js';
 import { log } from '../lib/utils.js';
 
@@ -80,13 +80,50 @@ export async function appendElementsForGW(env, season, gw) {
   const key = kSeasonElements(season);
   const cur = (await kvGetJSON(env.FPL_PULSE_KV, key)) || { last_gw_processed: 0, gws: {} };
   if (!cur.gws || typeof cur.gws !== "object") cur.gws = {};
-  if (cur.gws[gw]) return { wrote: false, reason: "already_present" };
+  // Skip only when the stored block is genuinely valid — a missing OR malformed
+  // (legacy-schema) block is re-fetched and overwritten with the canonical shape.
+  if (isValidGwElements(cur.gws[gw])) return { wrote: false, reason: "already_present" };
 
   const live = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/event/${gw}/live/`);
   cur.gws[gw] = live;
   cur.last_gw_processed = Math.max(Number(cur.last_gw_processed || 0), gw);
   await kvPutJSON(env.FPL_PULSE_KV, key, cur);
   return { wrote: true };
+}
+
+// Fill AND repair the season:elements spine for GW 1..upToGw. Any GW whose
+// stored block is missing or fails isValidGwElements (e.g. the legacy
+// element-keyed GW1) is re-fetched from event/{gw}/live and overwritten with the
+// canonical { elements: [...] } shape. One KV read + one KV write; up to one FPL
+// fetch per repaired GW. `limit` caps fetches per call so a large historical gap
+// can't blow the cron's 50-subrequest budget — the remainder fills next cycle.
+export async function backfillSeasonElements(env, season, upToGw, { limit = 38 } = {}) {
+  const key = kSeasonElements(season);
+  const cur = (await kvGetJSON(env.FPL_PULSE_KV, key)) || { last_gw_processed: 0, gws: {} };
+  if (!cur.gws || typeof cur.gws !== "object") cur.gws = {};
+
+  const filled = [];
+  const repaired = [];
+  let fetched = 0;
+  for (let gw = 1; gw <= upToGw; gw++) {
+    const existing = cur.gws[gw];
+    if (isValidGwElements(existing)) continue;
+    if (fetched >= limit) break;
+    const live = await fetchJsonWithRetry(`https://fantasy.premierleague.com/api/event/${gw}/live/`);
+    fetched++;
+    if (!isValidGwElements(live)) continue; // FPL returned nothing usable; leave the gap for next cycle
+    (existing ? repaired : filled).push(gw);
+    cur.gws[gw] = live;
+  }
+
+  const written = filled.length + repaired.length;
+  if (written > 0) {
+    const gwNums = Object.keys(cur.gws).map(Number).filter(Number.isFinite);
+    cur.last_gw_processed = Math.max(Number(cur.last_gw_processed || 0), ...gwNums);
+    await kvPutJSON(env.FPL_PULSE_KV, key, cur);
+    log.info("harvest", "elements_backfilled", { season, up_to_gw: upToGw, filled, repaired });
+  }
+  return { written, filled, repaired, last_gw_processed: cur.last_gw_processed };
 }
 
 export async function updateEntryForGW(env, season, entryId, gw) {
@@ -233,7 +270,9 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   }
 
   await kvPutJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season), bootstrap);
-  await appendElementsForGW(env, season, prevId);
+  // Fill the new GW and self-heal any earlier gaps; capped so a large historical
+  // gap can't exhaust the cron's subrequest budget (the rest fills next cycle).
+  await backfillSeasonElements(env, season, prevId, { limit: 4 });
 
   // Harvest optimization: batch KV list reads and process in parallel
   let cursor;

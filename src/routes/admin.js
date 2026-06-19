@@ -1,8 +1,8 @@
 import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult } from '../lib/utils.js';
 import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
-import { fetchJson, circuitBreaker, sleep } from '../lib/fpl-api.js';
+import { fetchJson, fetchBootstrap, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
-import { harvestIfNeeded, warmCache, processPurgeQueue } from '../services/harvest.js';
+import { harvestIfNeeded, warmCache, processPurgeQueue, backfillSeasonElements, detectLatestFinishedGW } from '../services/harvest.js';
 
 // === KV audit helpers ===
 
@@ -770,6 +770,31 @@ export async function handleAdminRoute(request, env, season) {
     const delay = Number(new URL(request.url).searchParams.get("delay") || 0);
     const res = await harvestIfNeeded(env, { delaySec: delay });
     return json(res, res.status === "ok" || res.status === "noop" ? 200 : 202);
+  }
+
+  // POST /admin/season/elements/backfill — repair/fill the season:elements spine.
+  // One-off recovery for missing or legacy-schema early-GW blocks (the harvest
+  // snapshot gate stops the cron re-running once last_gw is caught up, so the
+  // existing gap must be repaired here). Re-fetches event/{gw}/live for every
+  // GW 1..latest-finished that is missing or invalid, then purges the edge cache.
+  if (path === "/admin/season/elements/backfill") {
+    const bootstrap = await fetchBootstrap();
+    const upTo = detectLatestFinishedGW(bootstrap);
+    if (!Number.isInteger(upTo)) return json({ error: "no_finished_gw" }, 422);
+
+    const result = await backfillSeasonElements(env, season, upTo);
+
+    // Purge the global season:elements edge cache so clients read the repair
+    // (mirrors processPurgeQueue's cache.delete(new Request(url)) pattern).
+    try {
+      await caches.default.delete(new Request("https://fpl-pulse.ciaranbrennan18.workers.dev/v1/season/elements"));
+    } catch (_e) { /* best-effort purge; TTL/cron purge is the safety net */ }
+
+    const backfillResult = { ok: true, up_to_gw: upTo, ...result };
+    if (idempotencyKey) {
+      await storeIdempotencyResult(env, idempotencyKey, backfillResult, 200);
+    }
+    return json(backfillResult, 200);
   }
 
   // POST /admin/warm — builds purge queue then immediately processes the first batch.
