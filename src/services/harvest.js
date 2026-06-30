@@ -1,4 +1,4 @@
-import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kDetectedSeason, kPurgeQueue, isValidGwElements } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kLeagueStandings, kDetectedSeason, kPurgeQueue, isValidGwElements } from '../lib/kv.js';
 import { fetchJsonWithRetry, fetchBootstrap } from '../lib/fpl-api.js';
 import { log } from '../lib/utils.js';
 
@@ -124,6 +124,167 @@ export async function backfillSeasonElements(env, season, upToGw, { limit = 38 }
     log.info("harvest", "elements_backfilled", { season, up_to_gw: upToGw, filled, repaired });
   }
   return { written, filled, repaired, last_gw_processed: cur.last_gw_processed };
+}
+
+// === Final league standings archive (season-rollover capture) ===
+//
+// When FPL rolls over to the next season, classic-league standings reset
+// PERMANENTLY and the final ranks/points are unrecoverable from the API. This
+// captures the FULL final table for each tracked league into a write-once KV key
+// (league:<id>:<season>:standings) so the data survives the rollover.
+//
+// SUBREQUEST BUDGET: like the cron, every fetch() counts against Cloudflare's
+// 50-per-invocation cap. archiveAllLeagueStandings bounds total standings-page
+// fetches to STANDINGS_FETCH_BUDGET and reports any leagues it could not reach in
+// `remaining`, so the endpoint can be re-invoked to finish the capture. The
+// write-once guard makes re-invocation idempotent — already-final leagues are
+// skipped — so re-running until `remaining` is empty completes the job safely.
+const STANDINGS_FETCH_BUDGET = 45; // mirrors PURGE_BATCH_SIZE; 5 subrequest headroom
+
+// Page through one league's classic standings and write the full final table.
+// `budget` caps how many standings-page fetches this call may make; if the league
+// needs more pages than `budget` allows it aborts WITHOUT writing (never a partial
+// table) and returns status "budget_exhausted" with the pages it did spend, so the
+// caller can account for the subrequests used.
+export async function archiveLeagueStandings(env, leagueId, season, { force = false, isFinal = false, budget = STANDINGS_FETCH_BUDGET } = {}) {
+  const key = kLeagueStandings(leagueId, season);
+
+  // Write-once guard: never clobber a table already marked final unless forced.
+  // This is the landmine that stops a later (post-rollover) run replacing the
+  // saved table with a reset one.
+  const existing = await kvGetJSON(env.FPL_PULSE_KV, key);
+  if (existing && existing.final === true && !force) {
+    return { league_id: Number(leagueId), status: "skipped", reason: "already_final", pages_fetched: 0 };
+  }
+
+  const BASE = `https://fantasy.premierleague.com/api/leagues-classic/${leagueId}/standings/`;
+  const results = [];
+  let leagueMeta = null;
+  let page = 1;
+  let pagesFetched = 0;
+
+  // Defensive pagination — page through every page_standings, even past 50 members
+  // (unlike ingest's friends-only refusal). Capture-maximally: store rows untrimmed.
+  while (true) {
+    if (pagesFetched >= budget) {
+      // Out of budget mid-league — abort without writing a partial table.
+      return { league_id: Number(leagueId), status: "budget_exhausted", pages_fetched: pagesFetched };
+    }
+    const pageUrl = page === 1 ? BASE : `${BASE}?page_standings=${page}`;
+    const data = await fetchJsonWithRetry(pageUrl);
+    pagesFetched++;
+
+    const rows = data?.standings?.results;
+    const hasNext = Boolean(data?.standings?.has_next);
+    if (!Array.isArray(rows)) {
+      return { league_id: Number(leagueId), status: "error", reason: "unexpected_fpl_payload", page, pages_fetched: pagesFetched };
+    }
+    if (!leagueMeta && data?.league) leagueMeta = data.league;
+
+    for (const row of rows) results.push(row); // store full rows, untrimmed
+
+    if (!hasNext || rows.length === 0) break;
+    page += 1;
+  }
+
+  const value = {
+    season: Number(season),
+    harvested_at: new Date().toISOString(),
+    member_count: results.length,
+    final: Boolean(isFinal),
+    league: { id: Number(leagueId), name: leagueMeta?.name ?? null },
+    results,
+  };
+  await kvPutJSON(env.FPL_PULSE_KV, key, value);
+
+  log.info("standings", "archived", {
+    league_id: Number(leagueId), season: Number(season),
+    member_count: results.length, final: value.final,
+    pages: pagesFetched, overwrote: Boolean(existing),
+  });
+
+  return {
+    league_id: Number(leagueId), status: "written",
+    member_count: results.length, final: value.final,
+    pages_fetched: pagesFetched, overwrote: Boolean(existing),
+  };
+}
+
+// Archive final standings for every tracked league (or a single league for
+// testing). Determines `final` once from bootstrap, enumerates leagues via the same
+// KV scan warmCache uses, and bounds total fetches to STANDINGS_FETCH_BUDGET. One
+// league's failed fetch is collected and the run continues — never aborts the batch.
+export async function archiveAllLeagueStandings(env, season, { force = false, leagueId = null } = {}) {
+  // Determine finality once (1 subrequest). final:true only when every event is done.
+  const bootstrap = await fetchBootstrap();
+  const latestFinished = detectLatestFinishedGW(bootstrap);
+  const totalEvents = Array.isArray(bootstrap?.events) ? bootstrap.events.length : 0;
+  const isFinal = totalEvents > 0 && latestFinished === totalEvents;
+  let used = 1; // bootstrap fetch counted against the budget
+
+  // Resolve the league list: single-league test param, or KV scan (warmCache pattern).
+  let leagueIds;
+  if (leagueId != null) {
+    leagueIds = [String(leagueId)];
+  } else {
+    leagueIds = [];
+    let cursor;
+    do {
+      const page = await env.FPL_PULSE_KV.list({ prefix: "league:", cursor, limit: 100 });
+      cursor = page.cursor;
+      for (const k of page.keys) {
+        if (k.name.endsWith(":members")) leagueIds.push(k.name.split(":")[1]);
+      }
+    } while (cursor);
+  }
+
+  const archived = [];
+  const remaining = [];
+  let budgetExhausted = false;
+
+  for (let i = 0; i < leagueIds.length; i++) {
+    const id = leagueIds[i];
+    // Budget check at the league boundary — don't start a league we can't fund.
+    if (used >= STANDINGS_FETCH_BUDGET) {
+      budgetExhausted = true;
+      remaining.push(...leagueIds.slice(i).map(Number));
+      break;
+    }
+    try {
+      const res = await archiveLeagueStandings(env, id, season, {
+        force, isFinal, budget: STANDINGS_FETCH_BUDGET - used,
+      });
+      used += res.pages_fetched || 0;
+      archived.push(res);
+      if (res.status === "budget_exhausted") {
+        budgetExhausted = true;
+        remaining.push(...leagueIds.slice(i).map(Number)); // includes this (unwritten) league
+        break;
+      }
+    } catch (err) {
+      // One league's failure must not sink the run — collect and continue.
+      archived.push({ league_id: Number(id), status: "error", reason: String(err?.message || err) });
+    }
+  }
+
+  const written = archived.filter(r => r.status === "written").length;
+  const skipped = archived.filter(r => r.status === "skipped").length;
+  const failed = archived.filter(r => r.status === "error").length;
+
+  log.info("standings", "archive_run", {
+    season: Number(season), final: isFinal,
+    written, skipped, failed, remaining: remaining.length, budget_exhausted: budgetExhausted,
+  });
+
+  return {
+    ok: failed === 0 && !budgetExhausted,
+    season: Number(season),
+    final: isFinal,
+    archived,
+    remaining,
+    budget_exhausted: budgetExhausted,
+    summary: { total: leagueIds.length, written, skipped, failed, remaining: remaining.length },
+  };
 }
 
 export async function updateEntryForGW(env, season, entryId, gw) {

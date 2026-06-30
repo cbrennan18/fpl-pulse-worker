@@ -57,6 +57,7 @@ season:<year>:elements            # Player scores by GW
 entry:<id>:<season>               # Full season blob (picks, history, transfers)
 entry:<id>:<season>:state         # State machine: queued|building|complete|errored|dead
 league:<id>:members               # Array of entry IDs
+league:<id>:<season>:standings    # Archived FINAL classic standings (write-once when final). Full results[] + { season, harvested_at, member_count, final }
 snapshot:current                  # Last processed GW info
 heartbeat:<iso-timestamp>         # Cron liveness marker
 health:state_summary              # Precomputed entry state counts (updated hourly by cron)
@@ -88,6 +89,7 @@ All require authentication via `X-Refresh-Token` header.
 | `/admin/entries/dead` | GET | List all dead entries with error details |
 | `/admin/entries/:entryId/revive` | POST | Revive a single dead/errored entry |
 | `/admin/league/:leagueId/ingest` | POST | Ingest league members and enqueue new entries |
+| `/admin/standings/archive` | POST | Archive FINAL classic standings for all tracked leagues to write-once KV. Body `{ season, force?, leagueId? }`. Stamps `final:true` only when all events finished; never overwrites a final table unless `force`. Subrequest-budget bounded — re-invoke until `remaining` is empty |
 | `/admin/entry/:entryId/force-rebuild` | POST | Force full rebuild of entry blob |
 | `/admin/entry/:entryId/purge-cache` | POST | Purge edge cache for entry |
 | `/admin/entry/:entryId/enqueue` | POST | Manually enqueue single entry |
@@ -133,7 +135,7 @@ All require authentication via `X-Refresh-Token` header.
 ## Commands
 
 ```bash
-npx vitest run          # Run test suite (75 tests)
+npx vitest run          # Run test suite (94 tests)
 npx wrangler dev        # Local development server
 npx wrangler deploy     # Deploy to Cloudflare
 ```

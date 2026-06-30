@@ -18,6 +18,7 @@ export const kSnapshotCurrent = `snapshot:current`;
 export const kLeagueMembers   = (leagueId) => `league:${leagueId}:members`;
 export const kEntrySeason     = (entryId, season) => `entry:${entryId}:${season}`;
 export const kEntryState      = (entryId, season) => `entry:${entryId}:${season}:state`;
+export const kLeagueStandings = (leagueId, season) => `league:${leagueId}:${season}:standings`;
 export const kHealthStateSummary = `health:state_summary`;
 export const kDetectedSeason = `config:detected_season`;
 export const kPurgeQueue = `cache:purge_queue`;
@@ -44,6 +45,16 @@ export const isEntrySeason = (x) =>
   Array.isArray(x.transfers);
 
 export const isLeagueMembers = (x) => Array.isArray(x) && x.every((n) => Number.isInteger(n));
+
+// Archived final league standings (league:<id>:<season>:standings). Validates the
+// write-once blob shape so a later run can read back `final` and refuse to clobber it.
+export const isLeagueStandings = (x) =>
+  x && typeof x === "object" &&
+  typeof x.season === "number" &&
+  Array.isArray(x.results) &&
+  typeof x.member_count === "number" &&
+  typeof x.final === "boolean" &&
+  typeof x.harvested_at === "string";
 
 // === Limits ===
 export const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues

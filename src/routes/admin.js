@@ -2,7 +2,7 @@ import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult } f
 import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { fetchJson, fetchBootstrap, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
-import { harvestIfNeeded, warmCache, processPurgeQueue, backfillSeasonElements, detectLatestFinishedGW } from '../services/harvest.js';
+import { harvestIfNeeded, warmCache, processPurgeQueue, backfillSeasonElements, detectLatestFinishedGW, archiveAllLeagueStandings } from '../services/harvest.js';
 
 // === KV audit helpers ===
 
@@ -948,6 +948,40 @@ export async function handleAdminRoute(request, env, season) {
       await storeIdempotencyResult(env, idempotencyKey, batchSummary, 200);
     }
     return json(batchSummary, 200);
+  }
+
+  // POST /admin/standings/archive — capture FULL final classic standings for every
+  // tracked league into a write-once KV key (league:<id>:<season>:standings) before
+  // FPL's season rollover wipes them. `final:true` is stamped only when bootstrap
+  // confirms every event is finished; a final table is never overwritten unless
+  // `force` is set. Bounded by the subrequest budget — if `remaining` is non-empty,
+  // re-invoke until empty (already-final leagues are skipped, so re-runs are safe).
+  // Body: { season: <int, required>, force?: bool, leagueId?: <int, single-league test> }
+  if (path === "/admin/standings/archive") {
+    let body = {};
+    try {
+      const raw = await request.text();
+      if (raw) body = JSON.parse(raw);
+    } catch {
+      return json({ error: "invalid_json_body" }, 400);
+    }
+
+    const seasonNum = Number(body.season);
+    if (!Number.isInteger(seasonNum)) {
+      return json({ error: "season_required", message: "Body must include an integer `season` (e.g. 2025)." }, 400);
+    }
+    const force = Boolean(body.force);
+    let leagueId = null;
+    if (body.leagueId != null) {
+      leagueId = Number(body.leagueId);
+      if (!Number.isInteger(leagueId) || leagueId <= 0) return json({ error: "invalid_league_id" }, 400);
+    }
+
+    const result = await archiveAllLeagueStandings(env, seasonNum, { force, leagueId });
+    if (idempotencyKey) {
+      await storeIdempotencyResult(env, idempotencyKey, result, 200);
+    }
+    return json(result, 200);
   }
 
   return json({ error: "Admin route not found" }, 404);
