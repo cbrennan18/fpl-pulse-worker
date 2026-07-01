@@ -562,6 +562,14 @@ export async function handleAdminRoute(request, env, season) {
     const seasonNum = season;
     const BASE = `https://fantasy.premierleague.com/api/leagues-classic/${leagueId}/standings/`;
 
+    // One-off benchmark bypass (admin-gated route): ?allow_large=1 skips the friends-only
+    // page-1 refusal so a specific >50-member league can be ingested. The global
+    // MAX_LEAGUE_SIZE policy and the read routes (members / entries-pack) are untouched.
+    const allowLarge = url.searchParams.get("allow_large") === "1";
+    // Safety ceiling for the bypass so we can't accidentally page through a giant public
+    // league. Comfortably above the AE64 benchmark's 64 members.
+    const MAX_LARGE_INGEST = 100;
+
     // Pull standings pages until we collect <= MAX_LEAGUE_SIZE entries or there are no more pages
     // FPL classic standings page size is typically 50; enforce hard policy at 50 total.
     const members = [];
@@ -577,7 +585,8 @@ export async function handleAdminRoute(request, env, season) {
       }
 
       // Friends-only policy: if page 1 has a next page, league > MAX_LEAGUE_SIZE -> refuse
-      if (page === 1 && hasNext) {
+      // (unless the admin explicitly opted into a large one-off ingest).
+      if (page === 1 && hasNext && !allowLarge) {
         return json({
           error: "league_too_large",
           message: `League exceeds ${MAX_LEAGUE_SIZE} members (friends-only policy).`,
@@ -589,6 +598,9 @@ export async function handleAdminRoute(request, env, season) {
         const entryId = Number(row?.entry);
         if (Number.isInteger(entryId)) members.push(entryId);
       }
+
+      // Bypass safety ceiling: stop paging once we've collected enough.
+      if (allowLarge && members.length >= MAX_LARGE_INGEST) break;
 
       if (!hasNext || results.length === 0) break;
       page += 1;
