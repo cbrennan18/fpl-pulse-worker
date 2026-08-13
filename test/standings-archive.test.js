@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { archiveLeagueStandings, archiveAllLeagueStandings } from '../src/services/harvest.js';
+import { archiveLeagueStandings, archiveAllLeagueStandings, standingsProvenance } from '../src/services/harvest.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
-import { kLeagueStandings, kLeagueMembers, isLeagueStandings } from '../src/lib/kv.js';
+import { kLeagueStandings, kLeagueMembers, kSeasonBootstrap, kDetectedSeason, isLeagueStandings } from '../src/lib/kv.js';
 import { createMockEnv, mockFetch } from './helpers/mocks.js';
 
 const BOOT = 'https://fantasy.premierleague.com/api/bootstrap-static/';
@@ -31,7 +31,9 @@ const standingsPage = (id, name, results, hasNext = false) => ({
   standings: { has_next: hasNext, results },
 });
 
-// All-events-finished bootstrap → detectLatestFinishedGW === events.length → final.
+const idRange = (start, count) => Array.from({ length: count }, (_, i) => start + i);
+
+// All events finished+data_checked → the archived season is complete → final.
 const completeBootstrap = (n = 38) => ({
   events: Array.from({ length: n }, (_, i) => ({
     id: i + 1,
@@ -57,7 +59,11 @@ describe('archiveLeagueStandings', () => {
 
   beforeEach(() => {
     circuitBreaker.reset();
-    env = createMockEnv();
+    // Rosters recorded for THIS league in THIS season — the provenance ground truth.
+    env = createMockEnv({
+      [kLeagueMembers(852082, 2025)]: JSON.stringify([11, 22, 33]),
+      [kLeagueMembers(99, 2025)]: JSON.stringify(idRange(1, 52)),
+    });
   });
   afterEach(() => {
     if (cleanup) cleanup();
@@ -159,8 +165,10 @@ describe('archiveAllLeagueStandings', () => {
   beforeEach(() => {
     circuitBreaker.reset();
     env = createMockEnv({
-      [kLeagueMembers(111)]: JSON.stringify([1, 2]),
-      [kLeagueMembers(222)]: JSON.stringify([3, 4]),
+      [kLeagueMembers(111, 2025)]: JSON.stringify([1, 2]),
+      [kLeagueMembers(222, 2025)]: JSON.stringify([3, 4]),
+      // Finality is read from the ARCHIVED season's stored bootstrap, never the live API.
+      [kSeasonBootstrap(2025)]: JSON.stringify(completeBootstrap()),
     });
   });
   afterEach(() => {
@@ -170,7 +178,6 @@ describe('archiveAllLeagueStandings', () => {
 
   it('archives every tracked league discovered via KV scan, final when season complete', async () => {
     cleanup = mockFetch({
-      [BOOT]: completeBootstrap(),
       [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
       [standingsUrl(222)]: standingsPage(222, 'L222', [row(3, 1, 200)]),
     });
@@ -183,9 +190,9 @@ describe('archiveAllLeagueStandings', () => {
     expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(222, 2025)).final).toBe(true);
   });
 
-  it('does NOT mark final when the season is still in progress', async () => {
+  it('does NOT mark final when the archived season is still in progress', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(2025), JSON.stringify(midSeasonBootstrap()));
     cleanup = mockFetch({
-      [BOOT]: midSeasonBootstrap(),
       [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
       [standingsUrl(222)]: standingsPage(222, 'L222', [row(3, 1, 200)]),
     });
@@ -197,7 +204,6 @@ describe('archiveAllLeagueStandings', () => {
 
   it('one league failing does not sink the run', async () => {
     cleanup = mockFetch({
-      [BOOT]: completeBootstrap(),
       [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
       [standingsUrl(222)]: new Error('boom'),
     });
@@ -212,7 +218,6 @@ describe('archiveAllLeagueStandings', () => {
 
   it('targets a single league when leagueId is supplied', async () => {
     cleanup = mockFetch({
-      [BOOT]: completeBootstrap(),
       [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
     });
 
@@ -222,9 +227,40 @@ describe('archiveAllLeagueStandings', () => {
     expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(222, 2025))).toBeNull(); // untouched
   });
 
+  // FPL reassigns mini-league IDs every season, so an ID present only in an OLD
+  // season's roster names a different league today. Archiving it would fetch a
+  // stranger's live table and store it as this season's result.
+  it('ignores leagues whose members key belongs to a different season', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(333, 2024), JSON.stringify([9, 10]));
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+      [standingsUrl(222)]: standingsPage(222, 'L222', [row(3, 1, 200)]),
+      // No route for 333: if it were scanned, the fetch would 404 and show as failed.
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.summary.total).toBe(2);
+    expect(res.summary.failed).toBe(0);
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(333, 2025))).toBeNull();
+  });
+
+  // A pre-migration key carries no season, so we cannot tell which season it
+  // describes — it must not be archived on a guess.
+  it('ignores a legacy unscoped members key', async () => {
+    await env.FPL_PULSE_KV.put('league:444:members', JSON.stringify([11, 12]));
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+      [standingsUrl(222)]: standingsPage(222, 'L222', [row(3, 1, 200)]),
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.summary.total).toBe(2);
+    expect(res.summary.failed).toBe(0);
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(444, 2025))).toBeNull();
+  });
+
   it('re-running after a final capture skips already-final leagues (idempotent resume)', async () => {
     cleanup = mockFetch({
-      [BOOT]: completeBootstrap(),
       [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
       [standingsUrl(222)]: standingsPage(222, 'L222', [row(3, 1, 200)]),
     });
@@ -233,5 +269,200 @@ describe('archiveAllLeagueStandings', () => {
     const second = await archiveAllLeagueStandings(env, 2025, {});
     expect(second.summary.written).toBe(0);
     expect(second.summary.skipped).toBe(2);
+  });
+});
+
+// === Archive provenance ===
+//
+// The live standings API only ever serves the CURRENT season. Archiving a past season
+// therefore fetches whatever league now holds that id — a different league belonging to
+// strangers — and, before this guard, wrote it under the archived season's key.
+describe('archiveLeagueStandings — provenance guard', () => {
+  let env;
+  let cleanup;
+
+  beforeEach(() => {
+    circuitBreaker.reset();
+    env = createMockEnv();
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  it('archives when the fetched table matches the recorded roster', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(9385, 2025), JSON.stringify([11, 22, 33]));
+    cleanup = mockFetch({
+      [standingsUrl(9385)]: standingsPage(9385, 'Dundanion Road', [row(11, 1, 2343), row(22, 2, 2296), row(33, 3, 2290)]),
+    });
+
+    const res = await archiveLeagueStandings(env, 9385, 2025, { isFinal: true });
+    expect(res.status).toBe('written');
+    expect(res.provenance).toMatchObject({ verified: true, overlap: 3, overlap_ratio: 1 });
+  });
+
+  // The headline bug: league 9385 in 2026 is a real, different league.
+  it('refuses a table that shares nothing with the recorded roster, and writes nothing', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(9385, 2025), JSON.stringify([11, 22, 33]));
+    cleanup = mockFetch({
+      [standingsUrl(9385)]: standingsPage(9385, "Someone Else's League", [
+        row(900001, 1, 2100), row(900002, 2, 2050), row(900003, 3, 2000),
+      ]),
+    });
+
+    const res = await archiveLeagueStandings(env, 9385, 2025, { isFinal: true });
+    expect(res.status).toBe('refused');
+    expect(res.reason).toBe('provenance_mismatch');
+    expect(res.provenance).toMatchObject({ overlap: 0, overlap_ratio: 0, member_count: 3 });
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(9385, 2025))).toBeNull();
+  });
+
+  // THE CASE A SEASON-EQUALITY CHECK GETS WRONG. Mid-July: FPL has published the new
+  // fixture list so detection reports 2026, but classic standings still serve 2025.
+  // `season !== getEffectiveSeason(env)` would refuse here — exactly when the data is
+  // still retrievable and about to be destroyed. Provenance sees the roster and proceeds.
+  it('archives during the July window, when detection has flipped but standings have not', async () => {
+    await env.FPL_PULSE_KV.put(kDetectedSeason, JSON.stringify({
+      season: 2026, detected_at: new Date().toISOString(),
+    }));
+    await env.FPL_PULSE_KV.put(kLeagueMembers(9385, 2025), JSON.stringify([11, 22, 33]));
+    cleanup = mockFetch({
+      [standingsUrl(9385)]: standingsPage(9385, 'Dundanion Road', [row(11, 1, 2343), row(22, 2, 2296), row(33, 3, 2290)]),
+    });
+
+    const res = await archiveLeagueStandings(env, 9385, 2025, { isFinal: true });
+    expect(res.status).toBe('written');
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(9385, 2025)).results).toHaveLength(3);
+  });
+
+  // The mistyped-league-id path: archiveAllLeagueStandings finds leagues VIA members keys,
+  // but the single-league `leagueId` option bypasses that scan entirely.
+  it('refuses when no roster was ever recorded for that league and season', async () => {
+    cleanup = mockFetch({
+      [standingsUrl(4242)]: standingsPage(4242, 'Unknown', [row(1, 1, 100), row(2, 2, 90)]),
+    });
+
+    const res = await archiveLeagueStandings(env, 4242, 2025, { isFinal: true });
+    expect(res.status).toBe('refused');
+    expect(res.reason).toBe('no_members_key');
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(4242, 2025))).toBeNull();
+  });
+
+  it('allow_unverified overrides the refusal', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(9385, 2025), JSON.stringify([11, 22, 33]));
+    cleanup = mockFetch({
+      [standingsUrl(9385)]: standingsPage(9385, 'Other', [row(900001, 1, 2100)]),
+    });
+
+    const res = await archiveLeagueStandings(env, 9385, 2025, { isFinal: true, allowUnverified: true });
+    expect(res.status).toBe('written');
+    expect(res.provenance.verified).toBe(false);
+  });
+
+  it('tolerates summer churn — a majority of the roster still present', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(9385, 2025), JSON.stringify(idRange(1, 10)));
+    cleanup = mockFetch({
+      // 6 of 10 remain, 4 left over the summer.
+      [standingsUrl(9385)]: standingsPage(9385, 'L', idRange(1, 6).map((e, i) => row(e, i + 1, 100 - i))),
+    });
+
+    const res = await archiveLeagueStandings(env, 9385, 2025, { isFinal: true });
+    expect(res.status).toBe('written');
+    expect(res.provenance.overlap_ratio).toBe(0.6);
+  });
+
+  // The absolute floor carries the case the ratio gets wrong: a league that grew a lot
+  // keeps only a small FRACTION of its old roster while obviously being the same league.
+  it('accepts a heavily grown league via the absolute overlap floor', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(9385, 2025), JSON.stringify(idRange(1, 20)));
+    cleanup = mockFetch({
+      [standingsUrl(9385)]: standingsPage(9385, 'L', [
+        ...idRange(1, 3).map((e, i) => row(e, i + 1, 100 - i)),
+        ...idRange(500, 50).map((e, i) => row(e, i + 4, 50 - i)),
+      ]),
+    });
+
+    const res = await archiveLeagueStandings(env, 9385, 2025, { isFinal: true });
+    expect(res.status).toBe('written');
+    expect(res.provenance.overlap).toBe(3);
+    expect(res.provenance.overlap_ratio).toBe(0.15); // below the ratio rule; the floor carries it
+  });
+});
+
+describe('standingsProvenance thresholds', () => {
+  const rows = (ids) => ids.map((e, i) => ({ entry: e, rank: i + 1 }));
+
+  it('is unverified with no roster to compare against', () => {
+    expect(standingsProvenance(rows([1, 2]), null).reason).toBe('no_members_key');
+    expect(standingsProvenance(rows([1, 2]), []).reason).toBe('no_members_key');
+  });
+
+  it('measures overlap against the recorded roster, not the fetched table', () => {
+    // 20 fetched, 2 of the 2 recorded members present → ratio 1, not 0.1.
+    const p = standingsProvenance(rows(idRange(1, 20)), [1, 2]);
+    expect(p).toMatchObject({ verified: true, overlap: 2, overlap_ratio: 1 });
+  });
+
+  // Small leagues are where the ratio is noisiest, and where allow_unverified exists.
+  it('refuses a tiny league that has churned below both rules', () => {
+    const p = standingsProvenance(rows([1, 900001, 900002]), [1, 2, 3]);
+    expect(p.overlap).toBe(1);
+    expect(p.overlap_ratio).toBeCloseTo(0.33, 2);
+    expect(p.verified).toBe(false);
+  });
+
+  it('two unrelated leagues never verify', () => {
+    expect(standingsProvenance(rows(idRange(900000, 50)), idRange(1, 20)).verified).toBe(false);
+  });
+});
+
+describe('isFinal derivation', () => {
+  let env;
+  let cleanup;
+
+  beforeEach(() => {
+    circuitBreaker.reset();
+    env = createMockEnv({ [kLeagueMembers(111, 2025)]: JSON.stringify([1, 2]) });
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  // A live bootstrap describes whatever season FPL is currently serving. During a rollover
+  // that is not the season being archived, and stamping its finality here is how a
+  // mid-season table acquires a permanent final:true.
+  it('reads finality from the archived season, ignoring the live API entirely', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(2025), JSON.stringify(midSeasonBootstrap()));
+    cleanup = mockFetch({
+      // A live bootstrap saying "complete" must not leak into the 2025 archive.
+      [BOOT]: completeBootstrap(),
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.final).toBe(false);
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(111, 2025)).final).toBe(false);
+  });
+
+  it('stamps final when the archived season is complete', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(2025), JSON.stringify(completeBootstrap()));
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.final).toBe(true);
+  });
+
+  // No stored bootstrap is no evidence. A non-final archive stays overwritable and is
+  // never served as authoritative, so false is the safe answer.
+  it('does not stamp final when the archived season has no stored bootstrap', async () => {
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.final).toBe(false);
   });
 });

@@ -1,6 +1,6 @@
 import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kLeagueStandings, kDetectedSeason, kPurgeQueue, isValidGwElements } from '../lib/kv.js';
 import { fetchJsonWithRetry, fetchBootstrap } from '../lib/fpl-api.js';
-import { log } from '../lib/utils.js';
+import { log, fallbackSeason } from '../lib/utils.js';
 
 // === Season auto-detection ===
 // Detect current season from FPL API bootstrap-static
@@ -63,7 +63,7 @@ export async function getEffectiveSeason(env) {
   const detected = await detectSeasonFromAPI(env);
   if (detected) return detected;
 
-  return Number(env.SEASON || 2025);
+  return Number(env.SEASON || fallbackSeason());
 }
 
 export function detectLatestFinishedGW(bootstrap) {
@@ -141,12 +141,92 @@ export async function backfillSeasonElements(env, season, upToGw, { limit = 38 }
 // skipped — so re-running until `remaining` is empty completes the job safely.
 const STANDINGS_FETCH_BUDGET = 45; // mirrors PURGE_BATCH_SIZE; 5 subrequest headroom
 
+// === Provenance: does the fetched table actually belong to the season being archived? ===
+//
+// THIS IS NOT A SEASON-EQUALITY CHECK, AND MUST NOT BE REPLACED BY ONE.
+//
+// The obvious guard — refuse unless `season === getEffectiveSeason(env)` — is wrong, and
+// wrong in the worst direction. getEffectiveSeason derives the season from
+// events[0].deadline_time, so when FPL publishes the new fixture list in mid-July,
+// detection flips to the NEW season while classic standings still serve the OLD one:
+// mini-leagues do not reset until later. That gap is precisely the window this archive
+// exists to exploit. An equality check builds a lock that engages only when you need the
+// door open.
+//
+// The members key is the ground truth instead: it records who was in THIS league in THIS
+// season. If the live API is still serving that season's table, the entry IDs overlap
+// heavily. If the season has rolled — or a mistyped league id landed on someone else's
+// league — FPL has reassigned both league and entry IDs, so overlap collapses to zero.
+// Correct everywhere the equality check is correct, plus the July window.
+//
+// THRESHOLDS. Legitimate churn and a wrong league are not close together: a friends league
+// that loses a few members over the summer still overlaps most of its roster, while two
+// unrelated leagues share essentially nothing (entry IDs are 7-digit and reassigned every
+// season, so coincidental overlap is ~0). Anything in 0.2–0.5 separates them, so:
+//   - ratio >= 0.5   a simple majority of the recorded roster is still present
+//   - OR overlap >= 3  absolute floor, because the ratio is noisy for tiny leagues and
+//                      punishes a league that grew a lot (3 of 20 old members remaining
+//                      alongside 50 new joiners is a ratio of 0.15 but obviously the same
+//                      league). Three specific 7-digit IDs matching by chance is ~0.
+// Both rules require overlap > 0, so neither weakens the guard against the actual threat —
+// they differ only in how much churn they tolerate. A tiny league with heavy churn (1 of 3
+// remaining) can still fail both; that is what `allow_unverified` is for.
+export const MIN_PROVENANCE_RATIO = 0.5;
+export const MIN_PROVENANCE_OVERLAP = 3;
+
+export function standingsProvenance(results, members) {
+  const fetchedIds = (Array.isArray(results) ? results : [])
+    .map(r => Number(r?.entry))
+    .filter(Number.isFinite);
+
+  // No roster recorded for this league+season means no ground truth to check against.
+  // Refuse rather than assume: this is the mistyped-league-id path, since
+  // archiveAllLeagueStandings discovers leagues VIA members keys but the single-league
+  // `leagueId` option bypasses that scan entirely.
+  if (!Array.isArray(members) || members.length === 0) {
+    return {
+      verified: false, reason: "no_members_key",
+      member_count: 0, fetched_count: fetchedIds.length, overlap: 0, overlap_ratio: null,
+    };
+  }
+
+  const memberSet = new Set(members.map(Number));
+  const overlap = fetchedIds.filter(id => memberSet.has(id)).length;
+  // Denominator is the RECORDED roster, not the fetched table: a league that gained
+  // members should not be penalised for the joiners.
+  const ratio = overlap / members.length;
+  const verified = ratio >= MIN_PROVENANCE_RATIO || overlap >= MIN_PROVENANCE_OVERLAP;
+
+  return {
+    verified,
+    reason: verified ? null : "provenance_mismatch",
+    member_count: members.length,
+    fetched_count: fetchedIds.length,
+    overlap,
+    overlap_ratio: Number(ratio.toFixed(2)),
+  };
+}
+
+// Is the season being archived actually complete? Derived from THAT SEASON'S stored
+// bootstrap, never the live one — provenance passing does not make a live `final` flag
+// describe the right season, and a wrongly-stamped final:true is permanent under the
+// write-once guard and serves at 200.
+//
+// Checks every event rather than comparing a count to a max id, so a reshaped event list
+// cannot make a mid-season table look final. No stored bootstrap means no evidence, which
+// yields false — a non-final archive is overwritable and never served as authoritative.
+export async function isArchivedSeasonFinal(env, season) {
+  const stored = await kvGetJSON(env.FPL_PULSE_KV, kSeasonBootstrap(season));
+  const events = Array.isArray(stored?.events) ? stored.events : [];
+  return events.length > 0 && events.every(e => e?.finished === true && e?.data_checked === true);
+}
+
 // Page through one league's classic standings and write the full final table.
 // `budget` caps how many standings-page fetches this call may make; if the league
 // needs more pages than `budget` allows it aborts WITHOUT writing (never a partial
 // table) and returns status "budget_exhausted" with the pages it did spend, so the
 // caller can account for the subrequests used.
-export async function archiveLeagueStandings(env, leagueId, season, { force = false, isFinal = false, budget = STANDINGS_FETCH_BUDGET } = {}) {
+export async function archiveLeagueStandings(env, leagueId, season, { force = false, isFinal = false, budget = STANDINGS_FETCH_BUDGET, allowUnverified = false } = {}) {
   const key = kLeagueStandings(leagueId, season);
 
   // Write-once guard: never clobber a table already marked final unless forced.
@@ -187,6 +267,21 @@ export async function archiveLeagueStandings(env, leagueId, season, { force = fa
     page += 1;
   }
 
+  // PROVENANCE GATE — the last thing before the write. The pages have been fetched, so the
+  // subrequests are already spent either way; refusing here costs nothing extra and is the
+  // only point at which the fetched table can be compared against the recorded roster.
+  const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId, season));
+  const provenance = standingsProvenance(results, members);
+  if (!provenance.verified && !allowUnverified) {
+    log.warn("standings", "provenance_refused", {
+      league_id: Number(leagueId), season: Number(season), ...provenance,
+    });
+    return {
+      league_id: Number(leagueId), status: "refused",
+      reason: provenance.reason, provenance, pages_fetched: pagesFetched,
+    };
+  }
+
   const value = {
     season: Number(season),
     harvested_at: new Date().toISOString(),
@@ -201,12 +296,14 @@ export async function archiveLeagueStandings(env, leagueId, season, { force = fa
     league_id: Number(leagueId), season: Number(season),
     member_count: results.length, final: value.final,
     pages: pagesFetched, overwrote: Boolean(existing),
+    overlap_ratio: provenance.overlap_ratio, unverified: !provenance.verified,
   });
 
   return {
     league_id: Number(leagueId), status: "written",
     member_count: results.length, final: value.final,
     pages_fetched: pagesFetched, overwrote: Boolean(existing),
+    provenance,
   };
 }
 
@@ -214,13 +311,14 @@ export async function archiveLeagueStandings(env, leagueId, season, { force = fa
 // testing). Determines `final` once from bootstrap, enumerates leagues via the same
 // KV scan warmCache uses, and bounds total fetches to STANDINGS_FETCH_BUDGET. One
 // league's failed fetch is collected and the run continues — never aborts the batch.
-export async function archiveAllLeagueStandings(env, season, { force = false, leagueId = null } = {}) {
-  // Determine finality once (1 subrequest). final:true only when every event is done.
-  const bootstrap = await fetchBootstrap();
-  const latestFinished = detectLatestFinishedGW(bootstrap);
-  const totalEvents = Array.isArray(bootstrap?.events) ? bootstrap.events.length : 0;
-  const isFinal = totalEvents > 0 && latestFinished === totalEvents;
-  let used = 1; // bootstrap fetch counted against the budget
+export async function archiveAllLeagueStandings(env, season, { force = false, leagueId = null, allowUnverified = false } = {}) {
+  // Finality comes from the ARCHIVED season's own stored bootstrap, not the live API. The
+  // live bootstrap describes whatever season FPL is currently serving, which during a
+  // rollover is not the one being archived — stamping its finality here is how a
+  // mid-season table acquires a permanent final:true. Reading from KV also costs zero
+  // subrequests, so the budget now starts at 0 rather than 1.
+  const isFinal = await isArchivedSeasonFinal(env, season);
+  let used = 0;
 
   // Resolve the league list: single-league test param, or KV scan (warmCache pattern).
   let leagueIds;
@@ -233,7 +331,16 @@ export async function archiveAllLeagueStandings(env, season, { force = false, le
       const page = await env.FPL_PULSE_KV.list({ prefix: "league:", cursor, limit: 100 });
       cursor = page.cursor;
       for (const k of page.keys) {
-        if (k.name.endsWith(":members")) leagueIds.push(k.name.split(":")[1]);
+        // Only members keys belonging to THE SEASON BEING ARCHIVED. FPL reassigns
+        // league IDs every season, so a season-blind scan would take an old season's
+        // league ID, fetch whatever league holds that ID today, and write a
+        // stranger's table into league:<id>:<season>:standings. Legacy unscoped
+        // keys (league:<id>:members) carry no season and are skipped for the same
+        // reason — we cannot tell which season they describe.
+        const parts = k.name.split(":"); // ["league", "<id>", "<season>", "members"]
+        if (parts.length === 4 && parts[3] === "members" && parts[2] === String(season)) {
+          leagueIds.push(parts[1]);
+        }
       }
     } while (cursor);
   }
@@ -252,7 +359,7 @@ export async function archiveAllLeagueStandings(env, season, { force = false, le
     }
     try {
       const res = await archiveLeagueStandings(env, id, season, {
-        force, isFinal, budget: STANDINGS_FETCH_BUDGET - used,
+        force, isFinal, allowUnverified, budget: STANDINGS_FETCH_BUDGET - used,
       });
       used += res.pages_fetched || 0;
       archived.push(res);
@@ -270,20 +377,21 @@ export async function archiveAllLeagueStandings(env, season, { force = false, le
   const written = archived.filter(r => r.status === "written").length;
   const skipped = archived.filter(r => r.status === "skipped").length;
   const failed = archived.filter(r => r.status === "error").length;
+  const refused = archived.filter(r => r.status === "refused").length;
 
   log.info("standings", "archive_run", {
     season: Number(season), final: isFinal,
-    written, skipped, failed, remaining: remaining.length, budget_exhausted: budgetExhausted,
+    written, skipped, failed, refused, remaining: remaining.length, budget_exhausted: budgetExhausted,
   });
 
   return {
-    ok: failed === 0 && !budgetExhausted,
+    ok: failed === 0 && refused === 0 && !budgetExhausted,
     season: Number(season),
     final: isFinal,
     archived,
     remaining,
     budget_exhausted: budgetExhausted,
-    summary: { total: leagueIds.length, written, skipped, failed, remaining: remaining.length },
+    summary: { total: leagueIds.length, written, skipped, failed, refused, remaining: remaining.length },
   };
 }
 
@@ -512,9 +620,15 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
 //   2. Per-league aggregates    — entries-pack, standings, members (league page)
 //   3. Individual entry blobs   — home + pulse pages
 //
-// SCALE:
-//   Current (4 leagues, ~36 entries ≈ 51 items): clears in 2 cron cycles (≤ 2h after harvest).
-//   Up to ~8 leagues + ~100 entries: clears in 3–4 cycles.
+// SCALE (each /v1 artefact is queued twice — legacy + season-prefixed URL):
+//   Current (4 leagues, ~36 entries): 5 globals + 4x5 league + 36x2 entry = 97 items,
+//     clearing in 3 cron cycles (≤ 3h after harvest). Was 51 items / 2 cycles before
+//     season-prefixed routes existed.
+//   Up to ~8 leagues + ~100 entries: 245 items, 6 cycles.
+//   Nothing overflows — each invocation still spends at most PURGE_BATCH_SIZE — but the
+//   drain window roughly doubles. Once the frontend addresses every artefact with an
+//   explicit season, the legacy unprefixed URLs become dead weight and can be dropped,
+//   returning the queue to its previous size.
 //   Future path for large-scale deployments: move worker to a custom Cloudflare domain,
 //   then use the Zone Cache Purge API — one fetch() call purges 30 URLs, eliminating
 //   the per-item subrequest cost entirely.
@@ -524,39 +638,65 @@ const PURGE_BATCH_SIZE = 45; // leaves 5 subrequest headroom against the 50-per-
 // Build and store a prioritised purge queue in KV — no cache ops, zero subrequests.
 export async function warmCache(env) {
   const base = "https://fpl-pulse.ciaranbrennan18.workers.dev";
+  // Every /v1 artefact is reachable at two URLs — the legacy unprefixed path and the
+  // season-prefixed one — and edge cache keys are path-only, so they are SEPARATE
+  // entries. Purging one leaves the other serving stale data behind an X-Cache: HIT for
+  // up to the full dynamicCacheHeaders TTL (7 days during an active GW, which is only
+  // safe *because* explicit purge is the real invalidation mechanism).
+  //
+  // Prefixed URLs are queued for the CURRENT season only. A closed season's data does
+  // not change, so purging it is pure budget waste.
+  const season = await getEffectiveSeason(env);
 
-  // Discover all leagues from KV
+  // Discover all leagues from KV. Deliberately season-BLIND (see CLAUDE.md): this
+  // scan matches every *:members key regardless of season, so after a rollover it
+  // warms previous-season league and entry IDs against current-season URLs. That is
+  // wasteful and log-noisy, not incorrect — purging a URL that holds nothing is a
+  // no-op. Left as-is on purpose; the season-scoped fix belongs with the wider
+  // warmCache rework. Keys are captured whole so the members read needs no season.
   let cursor;
-  const leagueIds = [];
+  const leagues = [];
   do {
     const page = await env.FPL_PULSE_KV.list({ prefix: "league:", cursor, limit: 100 });
     cursor = page.cursor;
     for (const k of page.keys) {
-      if (k.name.endsWith(":members")) leagueIds.push(k.name.split(":")[1]);
+      if (k.name.endsWith(":members")) leagues.push({ id: k.name.split(":")[1], membersKey: k.name });
     }
   } while (cursor);
 
   // Collect unique entry IDs across all leagues
   const entryIds = new Set();
-  for (const leagueId of leagueIds) {
-    const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
+  for (const { membersKey } of leagues) {
+    const members = await kvGetJSON(env.FPL_PULSE_KV, membersKey);
     if (Array.isArray(members)) members.forEach(id => entryIds.add(id));
   }
 
-  // Build prioritised list of URLs to purge from edge cache
+  // One league can surface under both a legacy and a season-scoped members key
+  // during the migration window — dedupe so its URLs are queued once.
+  const leagueIds = [...new Set(leagues.map(l => l.id))];
+
+  // Build prioritised list of URLs to purge from edge cache. Both addressing forms of
+  // each /v1 artefact are queued (see the note above); /fpl/* has only one form.
   const urls = [
     // Priority 1: global — every page depends on these
     `${base}/v1/season/elements`,
     `${base}/v1/season/bootstrap`,
+    `${base}/v1/${season}/elements`,
+    `${base}/v1/${season}/bootstrap`,
     `${base}/fpl/bootstrap`,
     // Priority 2: per-league aggregates — league page
     ...leagueIds.flatMap(id => [
       `${base}/fpl/league/${id}`,
       `${base}/v1/league/${id}/members`,
       `${base}/v1/league/${id}/entries-pack`,
+      `${base}/v1/${season}/league/${id}/members`,
+      `${base}/v1/${season}/league/${id}/entries-pack`,
     ]),
     // Priority 3: individual entry blobs — home + pulse pages
-    ...[...entryIds].map(id => `${base}/v1/entry/${id}`),
+    ...[...entryIds].flatMap(id => [
+      `${base}/v1/entry/${id}`,
+      `${base}/v1/${season}/entry/${id}`,
+    ]),
   ];
 
   await kvPutJSON(env.FPL_PULSE_KV, kPurgeQueue, {
@@ -569,9 +709,11 @@ export async function warmCache(env) {
     total: urls.length,
     leagues: leagueIds.length,
     entries: entryIds.size,
+    season,
+    cycles_to_drain: Math.ceil(urls.length / PURGE_BATCH_SIZE),
   });
 
-  return { status: "queued", total: urls.length, leagues: leagueIds.length, entries: entryIds.size };
+  return { status: "queued", total: urls.length, leagues: leagueIds.length, entries: entryIds.size, season };
 }
 
 // Process the next batch of cache purges from the KV queue.

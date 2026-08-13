@@ -15,7 +15,12 @@ export async function kvPutJSON(kv, key, value) {
 export const kSeasonBootstrap = (season) => `season:${season}:bootstrap`;
 export const kSeasonElements  = (season) => `season:${season}:elements`;
 export const kSnapshotCurrent = `snapshot:current`;
-export const kLeagueMembers   = (leagueId) => `league:${leagueId}:members`;
+// Season-scoped: FPL reassigns mini-league IDs every season in creation order, so
+// the same ID names a different league year to year. An unscoped members key would
+// let a later season's ingest silently overwrite a stored roster.
+// Shape is load-bearing: league-discovery scans match on the `:members` suffix and
+// take the league ID from split(":")[1] — keep both if this key ever changes again.
+export const kLeagueMembers   = (leagueId, season) => `league:${leagueId}:${season}:members`;
 export const kEntrySeason     = (entryId, season) => `entry:${entryId}:${season}`;
 export const kEntryState      = (entryId, season) => `entry:${entryId}:${season}:state`;
 export const kLeagueStandings = (leagueId, season) => `league:${leagueId}:${season}:standings`;

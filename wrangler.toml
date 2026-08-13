@@ -4,7 +4,21 @@ compatibility_date = "2025-08-01"
 
 [vars]
 APP_VERSION = "v1.3"
-SEASON = "2025"
+
+# SEASON — INTENTIONALLY UNSET, BUT HONOURED. Do not delete the code that reads it.
+#
+# Normal resolution is: KV detection cache (1h) → live FPL API → fallbackSeason() in
+# src/lib/utils.js. Setting a literal here would reintroduce a second copy of the year
+# that silently goes stale every August, which is the bug this replaced five copies of.
+#
+# It stays readable as an emergency override. Reach for it when detection is actively
+# WRONG rather than merely unavailable — e.g. FPL's preseason bootstrap reports an odd
+# first-event deadline and the Worker starts addressing the wrong season's keys. Setting
+# this var in the Cloudflare dashboard pins the season in seconds; the alternative is a
+# code deploy during a live data incident. Unset it once detection is correct again.
+#
+#   SEASON = "2025"
+#
 # REFRESH_TOKEN is a secret; set via wrangler secret put and .dev.vars
 
 

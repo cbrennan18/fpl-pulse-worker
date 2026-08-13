@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { isSeasonElements, isEntrySeason, isLeagueMembers } from '../src/lib/kv.js';
+import { isSeasonElements, isEntrySeason, isLeagueMembers, isLeagueStandings } from '../src/lib/kv.js';
 
 describe('isSeasonElements', () => {
   it('returns true for a valid season elements blob', () => {
@@ -117,5 +117,57 @@ describe('isLeagueMembers', () => {
 
   it('returns false for an object', () => {
     expect(isLeagueMembers({ 0: 1, 1: 2 })).toBe(false);
+  });
+});
+
+describe('isLeagueStandings', () => {
+  const valid = {
+    season: 2025,
+    harvested_at: '2026-05-25T18:00:00.000Z',
+    member_count: 3,
+    final: true,
+    results: [{ entry: 11, rank: 1, total: 2343 }],
+  };
+
+  it('returns true for a valid archived standings blob', () => {
+    expect(isLeagueStandings(valid)).toBe(true);
+  });
+
+  // LOAD-BEARING, and the reason the public route carries its own `final` check.
+  // The guard asks whether `final` is a boolean, not whether it is true — so a
+  // provisional mid-season capture validates exactly like a completed one. Anything
+  // relying on this guard alone to mean "safe to present as a result" is wrong.
+  it('accepts a provisional blob where final is false', () => {
+    expect(isLeagueStandings({ ...valid, final: false })).toBe(true);
+  });
+
+  it('returns false when final is missing or not a boolean', () => {
+    const { final, ...rest } = valid;
+    expect(isLeagueStandings(rest)).toBe(false);
+    expect(isLeagueStandings({ ...valid, final: 'true' })).toBe(false);
+  });
+
+  it('returns false when results is not an array', () => {
+    expect(isLeagueStandings({ ...valid, results: null })).toBe(false);
+  });
+
+  it('returns false when season is not a number', () => {
+    expect(isLeagueStandings({ ...valid, season: '2025' })).toBe(false);
+  });
+
+  it('returns false when member_count or harvested_at are missing', () => {
+    const { member_count, ...noCount } = valid;
+    expect(isLeagueStandings(noCount)).toBe(false);
+    const { harvested_at, ...noStamp } = valid;
+    expect(isLeagueStandings(noStamp)).toBe(false);
+  });
+
+  it('returns true for an empty results array — an empty league is not invalid', () => {
+    expect(isLeagueStandings({ ...valid, results: [], member_count: 0 })).toBe(true);
+  });
+
+  it('returns false for null and undefined', () => {
+    expect(isLeagueStandings(null)).toBeFalsy();
+    expect(isLeagueStandings(undefined)).toBeFalsy();
   });
 });

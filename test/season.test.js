@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { detectSeasonFromAPI, getEffectiveSeason, detectLatestFinishedGW } from '../src/services/harvest.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
 import { kDetectedSeason } from '../src/lib/kv.js';
+import { fallbackSeason, parseSeasonToken, MIN_SEASON, maxSeason } from '../src/lib/utils.js';
 import { createMockEnv, mockFetch, createBootstrap } from './helpers/mocks.js';
 
 describe('detectSeasonFromAPI', () => {
@@ -146,7 +147,9 @@ describe('getEffectiveSeason', () => {
     expect(season).toBe(2024);
   });
 
-  it('defaults to 2025 when no env.SEASON and detection fails', async () => {
+  // Asserts against the deriving function, not a literal year. A hardcoded expectation
+  // here would have to be edited every August — the failure this fallback exists to avoid.
+  it('falls back to the derived season when no env.SEASON and detection fails', async () => {
     delete env.SEASON;
 
     cleanup = mockFetch({
@@ -155,7 +158,69 @@ describe('getEffectiveSeason', () => {
     });
 
     const season = await getEffectiveSeason(env);
-    expect(season).toBe(2025);
+    expect(season).toBe(fallbackSeason());
+  });
+});
+
+describe('fallbackSeason', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('names a season for the calendar year it starts in', () => {
+    vi.setSystemTime(new Date('2026-08-01T00:00:00Z'));
+    expect(fallbackSeason()).toBe(2026);
+
+    vi.setSystemTime(new Date('2026-12-31T23:59:59Z'));
+    expect(fallbackSeason()).toBe(2026);
+
+    // Still 2026/27 in the spring of the following calendar year.
+    vi.setSystemTime(new Date('2027-05-20T00:00:00Z'));
+    expect(fallbackSeason()).toBe(2026);
+  });
+
+  // The known-wrong window, pinned deliberately: FPL's API has usually flipped to the
+  // coming season by mid-July while this still reports the one just finished. That is the
+  // safe direction — the older season's keys exist, so reads resolve.
+  it('reports the season just finished during the July changeover window', () => {
+    vi.setSystemTime(new Date('2027-07-15T00:00:00Z'));
+    expect(fallbackSeason()).toBe(2026);
+  });
+
+  it('never returns a year the season-token validator would reject', () => {
+    vi.setSystemTime(new Date('2026-09-01T00:00:00Z'));
+    expect(parseSeasonToken(String(fallbackSeason()))).toBe(fallbackSeason());
+  });
+});
+
+describe('parseSeasonToken', () => {
+  it('accepts a 4-digit year inside the supported range', () => {
+    expect(parseSeasonToken('2025')).toBe(2025);
+    expect(parseSeasonToken(String(MIN_SEASON))).toBe(MIN_SEASON);
+    expect(parseSeasonToken(String(maxSeason()))).toBe(maxSeason());
+  });
+
+  it('rejects years outside the supported range', () => {
+    expect(parseSeasonToken(String(MIN_SEASON - 1))).toBeNull();
+    expect(parseSeasonToken(String(maxSeason() + 1))).toBeNull();
+  });
+
+  // Each of these is accepted by a bare Number() and would build a KV key that
+  // silently addresses nothing.
+  it('rejects tokens a bare Number() parse would wrongly accept', () => {
+    expect(parseSeasonToken(' 2025')).toBeNull();
+    expect(parseSeasonToken('2025.0')).toBeNull();
+    expect(parseSeasonToken('2e3')).toBeNull();
+    expect(parseSeasonToken('0x7E9')).toBeNull();
+    expect(parseSeasonToken('')).toBeNull();
+  });
+
+  it('rejects the literal "season" path segment', () => {
+    expect(parseSeasonToken('season')).toBeNull();
+  });
+
+  it('rejects tokens that are not exactly four digits', () => {
+    expect(parseSeasonToken('202')).toBeNull();
+    expect(parseSeasonToken('20255')).toBeNull();
   });
 });
 

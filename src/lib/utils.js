@@ -1,3 +1,39 @@
+// === Season constants and parsing ===
+
+// Last-resort season. DERIVED, not a literal — a hardcoded year is wrong from the moment
+// someone forgets to bump it, which is the exact failure this replaced four copies of.
+//
+// Same August boundary detectSeasonFromAPI applies to a gameweek deadline: a season is
+// named for the calendar year it STARTS in, and starts in August. Aug-Dec → this year;
+// Jan-Jul → last year.
+//
+// Known window: in July, FPL's API has usually already flipped to the coming season while
+// this still reports the one just finished. That is the conservative direction — the older
+// season's keys definitely exist, so reads resolve instead of 404ing across the board.
+// A stale literal, by contrast, is wrong by a full year permanently. Wrong for a few weeks
+// in the safe direction beats wrong forever in the unsafe one.
+export const fallbackSeason = () => {
+  const now = new Date();
+  const year = now.getUTCFullYear();
+  return now.getUTCMonth() >= 7 ? year : year - 1; // getUTCMonth is 0-indexed; Aug = 7
+};
+
+// FPL's API era. Nothing older is addressable.
+export const MIN_SEASON = 2016;
+// +1 so a newly-rolled-over season is valid the moment detection reports it.
+export const maxSeason = () => new Date().getUTCFullYear() + 1;
+
+// Parse a season token taken from a URL PATH. Returns the number, or null if invalid.
+// Deliberately stricter than Number(): a bare Number() parse also accepts " 2025",
+// "2025.0", "2e3" and "0x7E9", all of which would then build a KV key that silently
+// addresses nothing. Four digits, or nothing.
+export const parseSeasonToken = (token) => {
+  if (!/^\d{4}$/.test(token)) return null;
+  const s = Number(token);
+  if (s < MIN_SEASON || s > maxSeason()) return null;
+  return s;
+};
+
 // === CORS setup ===
 // Ensures our API can be called from any client (browser, React app, etc.)
 export const CORS = {

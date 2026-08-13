@@ -1,44 +1,95 @@
-import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult } from '../lib/utils.js';
+import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult, fallbackSeason } from '../lib/utils.js';
 import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { fetchJson, fetchBootstrap, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
 import { harvestIfNeeded, warmCache, processPurgeQueue, backfillSeasonElements, detectLatestFinishedGW, archiveAllLeagueStandings } from '../services/harvest.js';
 
+// Both edge-cache addressing forms of a /v1 artefact. Cache keys are path-only, so the
+// legacy unprefixed URL and the season-prefixed URL are separate entries and a purge
+// that names only one leaves the other serving stale data. `suffix` is the artefact
+// path after /v1, e.g. "/entry/123" or "/league/9/entries-pack".
+const v1CacheUrls = (origin, season, suffix) => [
+  `${origin}/v1${suffix}`,
+  `${origin}/v1/${season}${suffix}`,
+];
+
 // === KV audit helpers ===
 
-// Categorize a raw KV key name into a known type
+// Categorize a raw KV key name into a known type.
+//
+// `archival: true` marks a key that IS the archive rather than debris: data FPL has
+// destroyed at its source and that a season-scoped read route serves. Bulk cleanup
+// targets must refuse these — see the old_season guard in /admin/kv/cleanup.
 function categorizeKey(keyName, currentSeason) {
   if (keyName.startsWith("heartbeat:")) return { type: "heartbeat" };
   if (keyName.startsWith("idempotency:")) return { type: "idempotency" };
   if (keyName === "config:detected_season") return { type: "config" };
   if (keyName === "health:state_summary") return { type: "health" };
   if (keyName === "snapshot:current") return { type: "snapshot" };
+  if (keyName === "cache:purge_queue") return { type: "cache_queue" };
 
   const seasonBoot = keyName.match(/^season:(\d+):bootstrap$/);
   if (seasonBoot) {
     const s = Number(seasonBoot[1]);
-    return { type: "season_bootstrap", season: s, is_current: s === currentSeason };
+    // An old season's bootstrap is load-bearing for reads of that season: it is what
+    // dynamicCacheHeaders resolves a TTL from. Deleting it degrades archived reads.
+    return { type: "season_bootstrap", season: s, is_current: s === currentSeason, archival: s !== currentSeason };
   }
   const seasonElem = keyName.match(/^season:(\d+):elements$/);
   if (seasonElem) {
     const s = Number(seasonElem[1]);
-    return { type: "season_elements", season: s, is_current: s === currentSeason };
+    // Served by /v1/<season>/elements and read directly by the Wrapped beats. FPL's
+    // event/<gw>/live endpoints do not survive the rollover, so this is unrebuildable.
+    return { type: "season_elements", season: s, is_current: s === currentSeason, archival: s !== currentSeason };
   }
 
   // entry:<id>:<season>:state must be checked before entry:<id>:<season>
+  //
+  // NOT archival, deliberately. State is build scaffolding: no read route serves it,
+  // and public.js consults it only when the blob is missing — where `errored`, `dead`
+  // and `complete` all 404 exactly as an absent key does. Deleting an old season's
+  // state is behaviourally invisible, and at one state per entry per season it is the
+  // bulk of the old-season namespace, so `old_season` keeps a real job to do.
   const entryState = keyName.match(/^entry:(\d+):(\d+):state$/);
   if (entryState) {
     const s = Number(entryState[2]);
     return { type: "entry_state", entry_id: Number(entryState[1]), season: s, is_current: s === currentSeason };
   }
+  // The blob itself IS the archive — served by /v1/<season>/entry/:id and the
+  // entries-pack, and unrebuildable once FPL reassigns the entry ID.
   const entryBlob = keyName.match(/^entry:(\d+):(\d+)$/);
   if (entryBlob) {
     const s = Number(entryBlob[2]);
-    return { type: "entry_blob", entry_id: Number(entryBlob[1]), season: s, is_current: s === currentSeason };
+    return { type: "entry_blob", entry_id: Number(entryBlob[1]), season: s, is_current: s === currentSeason, archival: s !== currentSeason };
   }
 
-  const league = keyName.match(/^league:(\d+):members$/);
-  if (league) return { type: "league_members", league_id: Number(league[1]) };
+  // league:<id>:<season>:members — the roster. Archive: FPL reassigns league IDs
+  // each season, so an old season's roster cannot be re-derived from the live API.
+  const leagueMembers = keyName.match(/^league:(\d+):(\d+):members$/);
+  if (leagueMembers) {
+    const s = Number(leagueMembers[2]);
+    return {
+      type: "league_members", league_id: Number(leagueMembers[1]),
+      season: s, is_current: s === currentSeason, archival: true,
+    };
+  }
+
+  // Pre-migration unscoped form. Kept as its own type (not "unknown") so an audit
+  // shows at a glance how many legacy keys are still awaiting deletion.
+  const legacyLeagueMembers = keyName.match(/^league:(\d+):members$/);
+  if (legacyLeagueMembers) {
+    return { type: "league_members_legacy", league_id: Number(legacyLeagueMembers[1]), archival: true };
+  }
+
+  // league:<id>:<season>:standings — final table, unrecoverable after FPL's rollover.
+  const leagueStandings = keyName.match(/^league:(\d+):(\d+):standings$/);
+  if (leagueStandings) {
+    const s = Number(leagueStandings[2]);
+    return {
+      type: "league_standings", league_id: Number(leagueStandings[1]),
+      season: s, is_current: s === currentSeason, archival: true,
+    };
+  }
 
   return { type: "unknown" };
 }
@@ -215,17 +266,18 @@ export async function handleAdminRoute(request, env, season) {
 
     // Detect current season
     const detected = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
-    const currentSeason = detected?.season ?? Number(env.SEASON || 2025);
+    const currentSeason = detected?.season ?? Number(env.SEASON || fallbackSeason());
 
     // Load league members for orphan detection
     const leagueId = new URL(request.url).searchParams.get("league_id") || env.WARM_LEAGUE_ID;
-    const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId)) : null;
+    const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId, currentSeason)) : null;
     const memberSet = Array.isArray(members) ? new Set(members) : null;
 
     // List and categorize all keys
     const allKeys = await listAllKeys(env.FPL_PULSE_KV);
     const categories = {};
     const oldSeasonKeys = [];
+    const archivalKeys = [];
     const orphanedEntries = new Map(); // entry_id -> [key names]
     const unknownKeys = [];
 
@@ -244,7 +296,11 @@ export async function handleAdminRoute(request, env, season) {
           if (cat.season && !categories[cat.type].old_seasons.includes(cat.season)) {
             categories[cat.type].old_seasons.push(cat.season);
           }
-          oldSeasonKeys.push(keyName);
+          // Split the list by what cleanup will actually do: archival keys are
+          // refused by the old_season target, so listing them as deletion
+          // candidates would misrepresent the next operation.
+          if (cat.archival) archivalKeys.push(keyName);
+          else oldSeasonKeys.push(keyName);
         }
       }
 
@@ -275,6 +331,8 @@ export async function handleAdminRoute(request, env, season) {
       categories,
       issues: {
         old_season_keys: oldSeasonKeys,
+        // Old-season keys that /admin/kv/cleanup will REFUSE to delete — the archive.
+        archival_keys: archivalKeys,
         orphaned_entries: [...orphanedEntries.entries()].map(([id, keys]) => ({ entry_id: id, keys })),
         unknown_keys: unknownKeys,
       },
@@ -289,9 +347,10 @@ export async function handleAdminRoute(request, env, season) {
           "snapshot:current (updated when new GW finishes)",
         ],
         requires_manual_management: [
-          "league:*:members (only updated via /admin/league/:id/ingest)",
+          "league:*:<season>:members (only updated via /admin/league/:id/ingest)",
+          "league:*:<season>:standings (only written by /admin/standings/archive)",
           "config:detected_season (updated on request, 1h freshness check)",
-          "Old season keys — never cleaned up automatically",
+          "Old season keys — never cleaned up automatically; archival ones are undeletable by /admin/kv/cleanup",
           "Orphaned entries (removed from league) — never cleaned up automatically",
         ],
       },
@@ -325,13 +384,13 @@ export async function handleAdminRoute(request, env, season) {
 
     // Detect current season
     const detected = await kvGetJSON(env.FPL_PULSE_KV, kDetectedSeason);
-    const currentSeason = detected?.season ?? Number(env.SEASON || 2025);
+    const currentSeason = detected?.season ?? Number(env.SEASON || fallbackSeason());
 
     // Load league members for orphan detection
     const leagueId = body.league_id || env.WARM_LEAGUE_ID;
     let memberSet = null;
     if (targets.includes("orphaned_entries")) {
-      const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId)) : null;
+      const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId, currentSeason)) : null;
       if (!Array.isArray(members)) {
         return json({ error: "Cannot detect orphans: league members not found", league_id: leagueId }, 400);
       }
@@ -341,6 +400,7 @@ export async function handleAdminRoute(request, env, season) {
     // List and categorize all keys, collect deletion candidates
     const allKeys = await listAllKeys(env.FPL_PULSE_KV);
     const toDelete = [];
+    const protectedKeys = [];
     const wantsOldSeason = targets.includes("old_season");
     const wantsOrphans = targets.includes("orphaned_entries");
 
@@ -349,6 +409,17 @@ export async function handleAdminRoute(request, env, season) {
 
       // Old season: entry/season keys where is_current === false
       if (wantsOldSeason && "is_current" in cat && !cat.is_current) {
+        // ARCHIVE GUARD. Old-season league rosters, final standings and bootstrap are
+        // data FPL has already destroyed at source and that season-scoped read routes
+        // serve — they are the archive, not debris. `old_season` is a bulk target
+        // meaning "delete what we no longer need", and confirm_count cannot tell the
+        // two apart: the operator types back whatever number the dry run produced.
+        // So the refusal is structural, not a prompt. Deleting one of these must be a
+        // separate, deliberately-named operation.
+        if (cat.archival) {
+          protectedKeys.push({ key: keyName, type: cat.type, season: cat.season, reason: "archival_protected" });
+          continue;
+        }
         toDelete.push({ key: keyName, type: cat.type, reason: "old_season", season: cat.season });
         continue;
       }
@@ -372,6 +443,8 @@ export async function handleAdminRoute(request, env, season) {
         would_delete_count: batch.length,
         capped,
         total_candidates: toDelete.length,
+        protected: protectedKeys,
+        protected_count: protectedKeys.length,
         summary: {
           by_reason: batch.reduce((acc, d) => { acc[d.reason] = (acc[d.reason] || 0) + 1; return acc; }, {}),
         },
@@ -406,6 +479,8 @@ export async function handleAdminRoute(request, env, season) {
       dry_run: false,
       deleted,
       failed,
+      protected: protectedKeys,
+      protected_count: protectedKeys.length,
       summary: {
         total_deleted: deleted.length,
         total_failed: failed.length,
@@ -416,6 +491,143 @@ export async function handleAdminRoute(request, env, season) {
       await storeIdempotencyResult(env, idempotencyKey, cleanupResult, 200);
     }
     return json(cleanupResult);
+  }
+
+  // POST /admin/kv/migrate-members — one-off migration of legacy unscoped league
+  // roster keys (league:<id>:members) to the season-scoped form
+  // (league:<id>:<season>:members).
+  //
+  // COPY, NEVER MOVE. The legacy key is left in place so the currently-deployed
+  // worker keeps serving from it while the new one rolls out. Deleting legacy keys is
+  // a separate deliberate act, after the new worker is verified live.
+  //
+  // `season` is REQUIRED and never defaulted. A legacy key holds whatever season was
+  // current when it was written, which is not necessarily the season the worker
+  // detects today — FPL rolls over in August, so a migration run after rollover would
+  // otherwise stamp last season's roster with this season's number, producing exactly
+  // the cross-season corruption this whole change exists to prevent.
+  //
+  // No confirm_count: the operation only ever creates new keys. It never overwrites an
+  // existing target and never deletes anything, so there is nothing to protect against.
+  //
+  // PROVENANCE GATE. The season passed in is stamped onto every legacy key found, but a
+  // legacy key carries no season of its own — it reflects whenever that league was last
+  // ingested. A league not re-ingested since an earlier season would be mislabelled, and
+  // a mislabelled roster then looks authoritative. So each key is checked against the
+  // entry namespace for the season being stamped:
+  //   blobs_present  — members with an entry:<id>:<season> blob. Near-total for a league
+  //                    genuinely of that season; zero for one carried over from earlier.
+  //   states_present — members with an entry:<id>:<season>:state. This is what separates
+  //                    "no blobs because WRONG SEASON" from "no blobs because NOT BUILT
+  //                    YET": a league ingested this week legitimately has zero blobs but
+  //                    a full set of queued states. Without it, a naive ratio gate would
+  //                    refuse precisely the most current leagues.
+  // Zero on BOTH, against a non-empty roster, means nothing in this season has ever
+  // referenced these entries — that key is blocked. `allow_unverified: true` overrides.
+  if (path === "/admin/kv/migrate-members" && request.method === "POST") {
+    log.info("admin", "endpoint_invoked", { path, method: "POST" });
+
+    let body = {};
+    try {
+      const raw = await request.text();
+      if (raw) body = JSON.parse(raw);
+    } catch {
+      return json({ error: "invalid_json_body" }, 400);
+    }
+
+    const seasonNum = Number(body.season);
+    if (!Number.isInteger(seasonNum)) {
+      return json({ error: "season_required", message: "Body must include an integer `season` (e.g. 2025)." }, 400);
+    }
+    const dryRun = body.dry_run !== false; // default true
+    const allowUnverified = body.allow_unverified === true;
+
+    // Enumerate legacy keys only — exactly league:<id>:members, never the scoped form.
+    const legacyKeys = [];
+    let cursor;
+    do {
+      const page = await env.FPL_PULSE_KV.list({ prefix: "league:", cursor, limit: 1000 });
+      cursor = page.cursor;
+      for (const k of page.keys) {
+        if (/^league:\d+:members$/.test(k.name)) legacyKeys.push(k.name);
+      }
+    } while (cursor);
+
+    const results = [];
+    for (const from of legacyKeys) {
+      const leagueId = from.split(":")[1];
+      const to = kLeagueMembers(leagueId, seasonNum);
+
+      const value = await kvGetJSON(env.FPL_PULSE_KV, from);
+      if (!isLeagueMembers(value)) {
+        results.push({ from, to, status: "invalid_source", member_count: null });
+        continue;
+      }
+
+      // Idempotent: an existing target is never overwritten, so re-running is safe.
+      const existing = await kvGetJSON(env.FPL_PULSE_KV, to);
+      if (existing !== null) {
+        results.push({ from, to, status: "skipped", reason: "target_exists", member_count: value.length });
+        continue;
+      }
+
+      // Provenance: does this roster have any footprint in the season being stamped?
+      // KV reads don't count against the subrequest budget, but they are not free in
+      // wall time, so they run in parallel and states are only read when the blob
+      // evidence is already zero (the sole case where the answer can change anything).
+      const blobs = await Promise.all(value.map(id => env.FPL_PULSE_KV.get(kEntrySeason(id, seasonNum))));
+      const blobsPresent = blobs.filter(b => b !== null).length;
+      let statesPresent = 0;
+      if (blobsPresent === 0 && value.length > 0) {
+        const states = await Promise.all(value.map(id => env.FPL_PULSE_KV.get(kEntryState(id, seasonNum))));
+        statesPresent = states.filter(s => s !== null).length;
+      }
+      const provenance = {
+        member_count: value.length,
+        blobs_present: blobsPresent,
+        states_present: statesPresent,
+        blob_ratio: value.length > 0 ? Number((blobsPresent / value.length).toFixed(2)) : null,
+      };
+
+      // An empty roster cannot be mislabelled into anything meaningful — let it pass.
+      const unverified = value.length > 0 && blobsPresent === 0 && statesPresent === 0;
+      if (unverified && !allowUnverified) {
+        results.push({ from, to, status: "blocked", reason: "no_season_evidence", provenance });
+        continue;
+      }
+
+      if (!dryRun) {
+        await kvPutJSON(env.FPL_PULSE_KV, to, value);
+        log.info("admin", "members_key_migrated", { from, to, member_count: value.length, provenance, forced: unverified });
+      }
+      results.push({
+        from, to,
+        status: dryRun ? "would_copy" : "copied",
+        member_count: value.length,
+        provenance,
+        ...(unverified ? { warning: "migrated without season evidence (allow_unverified)" } : {}),
+      });
+    }
+
+    const migrateResult = {
+      ok: results.every(r => r.status !== "invalid_source" && r.status !== "blocked"),
+      dry_run: dryRun,
+      season: seasonNum,
+      legacy_keys_found: legacyKeys.length,
+      results,
+      summary: {
+        copied: results.filter(r => r.status === "copied").length,
+        would_copy: results.filter(r => r.status === "would_copy").length,
+        skipped: results.filter(r => r.status === "skipped").length,
+        blocked: results.filter(r => r.status === "blocked").length,
+        invalid: results.filter(r => r.status === "invalid_source").length,
+      },
+      note: "Legacy keys are NOT deleted. Delete them only after the season-scoped worker is verified live.",
+    };
+    if (idempotencyKey) {
+      await storeIdempotencyResult(env, idempotencyKey, migrateResult, 200);
+    }
+    return json(migrateResult, 200);
   }
 
   // POST /admin/entries/states/bulk — Bulk actions on entries
@@ -609,8 +821,10 @@ export async function handleAdminRoute(request, env, season) {
     // De-dupe collected members just in case
     const uniqueMembers = Array.from(new Set(members));
 
-    // Write league members to KV
-    const leagueKey = kLeagueMembers(leagueIdStr);
+    // Write league members to KV under the season currently being tracked. Ingest
+    // never addresses a past season: it reads the LIVE standings API, so the roster
+    // it collects can only describe the season the worker has detected.
+    const leagueKey = kLeagueMembers(leagueIdStr, seasonNum);
     await kvPutJSON(env.FPL_PULSE_KV, leagueKey, uniqueMembers);
 
     // Enqueue new entries for backfill: create state if neither blob nor state exists
@@ -682,12 +896,12 @@ export async function handleAdminRoute(request, env, season) {
     // Optionally keep or overwrite the old blob; processEntryOnce will overwrite anyway
     const result = await processEntryOnce(entryId, seasonNum, env.FPL_PULSE_KV);
 
-    // Also purge edge cache for this entry
+    // Also purge edge cache for this entry — both addressing forms.
     try {
       const reqUrl = new URL(request.url);
-      const cacheUrl = `${reqUrl.protocol}//${reqUrl.host}/v1/entry/${entryId}`;
-      const cacheKey = cacheKeyFor(new Request(cacheUrl));
-      await caches.default.delete(cacheKey);
+      for (const cacheUrl of v1CacheUrls(`${reqUrl.protocol}//${reqUrl.host}`, seasonNum, `/entry/${entryId}`)) {
+        await caches.default.delete(cacheKeyFor(new Request(cacheUrl)));
+      }
     } catch (e) {
       log.warn("cache", "purge_failed", {
         entry_id: entryId,
@@ -712,10 +926,12 @@ export async function handleAdminRoute(request, env, season) {
 
     try {
       const reqUrl = new URL(request.url);
-      const cacheUrl = `${reqUrl.protocol}//${reqUrl.host}/v1/league/${leagueId}/entries-pack`;
-      const cacheKey = cacheKeyFor(new Request(cacheUrl));
-      const deleted = await caches.default.delete(cacheKey);
-      return json({ ok: true, deleted, league_id: leagueId, purged_url: cacheUrl });
+      const cacheUrls = v1CacheUrls(`${reqUrl.protocol}//${reqUrl.host}`, season, `/league/${leagueId}/entries-pack`);
+      const results = [];
+      for (const cacheUrl of cacheUrls) {
+        results.push(await caches.default.delete(cacheKeyFor(new Request(cacheUrl))));
+      }
+      return json({ ok: true, deleted: results.some(Boolean), league_id: leagueId, purged_urls: cacheUrls });
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
@@ -730,10 +946,12 @@ export async function handleAdminRoute(request, env, season) {
 
     try {
       const reqUrl = new URL(request.url);
-      const cacheUrl = `${reqUrl.protocol}//${reqUrl.host}/v1/entry/${entryId}`;
-      const cacheKey = cacheKeyFor(new Request(cacheUrl));
-      const deleted = await caches.default.delete(cacheKey);
-      return json({ ok: true, deleted, entry_id: entryId }, 200);
+      const cacheUrls = v1CacheUrls(`${reqUrl.protocol}//${reqUrl.host}`, season, `/entry/${entryId}`);
+      const results = [];
+      for (const cacheUrl of cacheUrls) {
+        results.push(await caches.default.delete(cacheKeyFor(new Request(cacheUrl))));
+      }
+      return json({ ok: true, deleted: results.some(Boolean), entry_id: entryId, purged_urls: cacheUrls }, 200);
     } catch (e) {
       return json({ ok: false, error: e.message }, 500);
     }
@@ -799,7 +1017,11 @@ export async function handleAdminRoute(request, env, season) {
     // Purge the global season:elements edge cache so clients read the repair
     // (mirrors processPurgeQueue's cache.delete(new Request(url)) pattern).
     try {
-      await caches.default.delete(new Request("https://fpl-pulse.ciaranbrennan18.workers.dev/v1/season/elements"));
+      const origin = "https://fpl-pulse.ciaranbrennan18.workers.dev";
+      // Unprefixed lives at /v1/season/elements; the prefixed form is /v1/<year>/elements.
+      for (const u of [`${origin}/v1/season/elements`, `${origin}/v1/${season}/elements`]) {
+        await caches.default.delete(new Request(u));
+      }
     } catch (_e) { /* best-effort purge; TTL/cron purge is the safety net */ }
 
     const backfillResult = { ok: true, up_to_gw: upTo, ...result };
@@ -904,7 +1126,7 @@ export async function handleAdminRoute(request, env, season) {
     let candidates = [];
     if (leagueId) {
       // From one league (≤ 50)
-      const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId));
+      const members = await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId, seasonNum));
       if (!isLeagueMembers(members)) {
         return json({ error: "invalid_or_missing_league", leagueId }, 404);
       }
@@ -983,13 +1205,16 @@ export async function handleAdminRoute(request, env, season) {
       return json({ error: "season_required", message: "Body must include an integer `season` (e.g. 2025)." }, 400);
     }
     const force = Boolean(body.force);
+    // Overrides the provenance check only — NOT the write-once guard, which is `force`.
+    // For a tiny league with heavy summer churn the overlap ratio is genuinely noisy.
+    const allowUnverified = body.allow_unverified === true;
     let leagueId = null;
     if (body.leagueId != null) {
       leagueId = Number(body.leagueId);
       if (!Number.isInteger(leagueId) || leagueId <= 0) return json({ error: "invalid_league_id" }, 400);
     }
 
-    const result = await archiveAllLeagueStandings(env, seasonNum, { force, leagueId });
+    const result = await archiveAllLeagueStandings(env, seasonNum, { force, leagueId, allowUnverified });
     if (idempotencyKey) {
       await storeIdempotencyResult(env, idempotencyKey, result, 200);
     }

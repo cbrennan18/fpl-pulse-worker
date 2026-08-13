@@ -93,6 +93,35 @@ export function mockFetch(routes = {}) {
 }
 
 /**
+ * Install a mock for the Workers `caches` global, which does not exist in Node.
+ * Keyed on request URL, matching the real edge cache — and matching cacheKeyFor,
+ * which strips the query string and forces method GET, so HEAD and GET of the same
+ * path share one entry. Returns { store, cleanup }; `store` is readable so a test can
+ * assert what was (or was NOT) cached.
+ */
+export function mockCaches() {
+  const store = new Map();
+  const original = globalThis.caches;
+
+  globalThis.caches = {
+    default: {
+      async match(req) {
+        const hit = store.get(typeof req === "string" ? req : req.url);
+        return hit ? hit.clone() : undefined;
+      },
+      async put(req, resp) {
+        store.set(typeof req === "string" ? req : req.url, resp.clone());
+      },
+      async delete(req) {
+        return store.delete(typeof req === "string" ? req : req.url);
+      },
+    },
+  };
+
+  return { store, cleanup: () => { globalThis.caches = original; } };
+}
+
+/**
  * Helper to create a minimal FPL bootstrap-static response.
  */
 export function createBootstrap({ season = 2025, events = [] } = {}) {

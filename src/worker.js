@@ -2,7 +2,7 @@
 // Thin dispatcher: routes requests to handlers and runs scheduled cron jobs.
 // All business logic lives in services/ and lib/.
 
-import { CORS, text, log } from './lib/utils.js';
+import { CORS, text, log, fallbackSeason } from './lib/utils.js';
 import { kvGetJSON, kDetectedSeason } from './lib/kv.js';
 import { handlePublicRoute } from './routes/public.js';
 import { handleAdminRoute } from './routes/admin.js';
@@ -24,7 +24,7 @@ export default {
       }
     }
     if (!season) {
-      season = Number(env.SEASON || 2025); // Fallback, cron will update cache
+      season = Number(env.SEASON || fallbackSeason()); // Fallback, cron will update cache
     }
 
     // Try public routes first (/health, /v1/*, /fpl/*)

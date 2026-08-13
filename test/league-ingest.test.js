@@ -62,7 +62,7 @@ describe('POST /admin/league/:id/ingest — allow_large bypass', () => {
     expect(body.error).toBe('league_too_large');
 
     // No KV footprint on refusal.
-    expect(env.FPL_PULSE_KV._getJSON(kLeagueMembers(String(LEAGUE_ID)))).toBeNull();
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueMembers(String(LEAGUE_ID), SEASON))).toBeNull();
   });
 
   it('ingests all 64 members in standings order WITH allow_large=1', async () => {
@@ -78,9 +78,12 @@ describe('POST /admin/league/:id/ingest — allow_large bypass', () => {
     expect(body.members_count).toBe(64);
     expect(body.queued_count).toBe(64);
 
-    // Members written to KV in rank order (1..64), and each new entry enqueued.
-    const members = env.FPL_PULSE_KV._getJSON(kLeagueMembers(String(LEAGUE_ID)));
+    // Members written to KV under the SEASON-SCOPED key, in rank order (1..64),
+    // and each new entry enqueued.
+    const members = env.FPL_PULSE_KV._getJSON(kLeagueMembers(String(LEAGUE_ID), SEASON));
     expect(members).toEqual(idRange(1, 64));
+    // Nothing left at the legacy unscoped key.
+    expect(env.FPL_PULSE_KV._getJSON(`league:${LEAGUE_ID}:members`)).toBeNull();
     const state = env.FPL_PULSE_KV._getJSON(kEntryState(1, SEASON));
     expect(state.status).toBe('queued');
   });
