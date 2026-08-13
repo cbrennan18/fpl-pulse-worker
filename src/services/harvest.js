@@ -1,4 +1,4 @@
-import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kLeagueStandings, kDetectedSeason, kPurgeQueue, isValidGwElements } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kSeasonElements, kEntrySeason, kSeasonBootstrap, kSnapshotCurrent, kLeagueMembers, kLeagueStandings, kDetectedSeason, kPurgeQueue, kSeasonClosed, isValidGwElements, isSeasonClosed } from '../lib/kv.js';
 import { fetchJsonWithRetry, fetchBootstrap } from '../lib/fpl-api.js';
 import { log, fallbackSeason } from '../lib/utils.js';
 
@@ -74,9 +74,48 @@ export function detectLatestFinishedGW(bootstrap) {
   return Math.max(...done.map(e => Number(e.id)).filter(Number.isFinite));
 }
 
+// The season's LAST gameweek id. Deliberately the max event id, not events.length —
+// those coincide in a normal 38-GW season but diverge the moment FPL's event list
+// changes shape, and a season would then close a gameweek early or never at all.
+export function detectFinalGW(bootstrap) {
+  const ids = Array.isArray(bootstrap?.events)
+    ? bootstrap.events.map(e => Number(e?.id)).filter(Number.isFinite)
+    : [];
+  if (!ids.length) return null;
+  return Math.max(...ids);
+}
+
+// === Season close ===
+//
+// Stamped in exactly ONE place: the tail of harvestIfNeeded, after the harvest that
+// processed the final gameweek has completed and advanced the snapshot. That ordering is
+// the whole trick — the harvest which triggers the close is itself a write to the season,
+// so the close cannot be a precondition of it. By the time this runs, the work is done;
+// the next cron tick then short-circuits at `already_up_to_date` before reaching any
+// write at all.
+//
+// Returns true only on the transition, so a reopened season is not silently re-closed:
+// after a reopen the snapshot still names the final gameweek, so harvestIfNeeded exits at
+// `already_up_to_date` long before reaching here. Re-closing is a deliberate admin act.
+export async function closeSeasonIfComplete(env, season, bootstrap, latestFinishedGw) {
+  const finalGw = detectFinalGW(bootstrap);
+  if (!Number.isInteger(finalGw) || latestFinishedGw !== finalGw) return false;
+
+  const key = kSeasonClosed(season);
+  if (await kvGetJSON(env.FPL_PULSE_KV, key)) return false; // already closed
+
+  await kvPutJSON(env.FPL_PULSE_KV, key, {
+    closed_at: new Date().toISOString(),
+    final_gw: finalGw,
+  });
+  log.info("season", "closed", { season: Number(season), final_gw: finalGw });
+  return true;
+}
+
 // === Harvest helpers ===
 
 export async function appendElementsForGW(env, season, gw) {
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) return { wrote: false, reason: "season_closed" };
   const key = kSeasonElements(season);
   const cur = (await kvGetJSON(env.FPL_PULSE_KV, key)) || { last_gw_processed: 0, gws: {} };
   if (!cur.gws || typeof cur.gws !== "object") cur.gws = {};
@@ -98,6 +137,9 @@ export async function appendElementsForGW(env, season, gw) {
 // fetch per repaired GW. `limit` caps fetches per call so a large historical gap
 // can't blow the cron's 50-subrequest budget — the remainder fills next cycle.
 export async function backfillSeasonElements(env, season, upToGw, { limit = 38 } = {}) {
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) {
+    return { written: 0, filled: [], repaired: [], reason: "season_closed" };
+  }
   const key = kSeasonElements(season);
   const cur = (await kvGetJSON(env.FPL_PULSE_KV, key)) || { last_gw_processed: 0, gws: {} };
   if (!cur.gws || typeof cur.gws !== "object") cur.gws = {};
@@ -396,6 +438,7 @@ export async function archiveAllLeagueStandings(env, season, { force = false, le
 }
 
 export async function updateEntryForGW(env, season, entryId, gw) {
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) return { updated: false, reason: "season_closed" };
   const seasonKey = kEntrySeason(entryId, season);
   const blob = await kvGetJSON(env.FPL_PULSE_KV, seasonKey);
   if (!blob || typeof blob !== "object") return { updated: false, reason: "no_blob" };
@@ -518,12 +561,23 @@ export async function updateEntryForGW(env, season, entryId, gw) {
 }
 
 export async function updateSnapshot(env, season, gw) {
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) return { updated: false, reason: "season_closed" };
   await kvPutJSON(env.FPL_PULSE_KV, kSnapshotCurrent, { season: Number(season), last_gw: Number(gw) });
+  return { updated: true };
 }
 
 export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   const season = await getEffectiveSeason(env);
   const t0 = Date.now();
+
+  // Closed seasons are immutable. Checked before the bootstrap fetch so a closed season
+  // costs one KV read per cron tick and no subrequests at all. Returned quietly, without
+  // a log line: this fires hourly forever once a season closes, and the marker itself is
+  // the durable record of why nothing is happening. The interesting event is the close,
+  // which is logged once.
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) {
+    return { status: "noop", reason: "season_closed", season };
+  }
 
   const bootstrap = await fetchBootstrap();
   const prevId = detectLatestFinishedGW(bootstrap);
@@ -597,7 +651,10 @@ export async function harvestIfNeeded(env, { delaySec = 0 } = {}) {
   // so the next cron cycle will retry the remaining entries.
   if (!timedOut) {
     await updateSnapshot(env, season, prevId);
-    return { status: "ok", last_gw: prevId };
+    // Close AFTER the snapshot advances. A partial harvest never reaches here, so a
+    // season cannot close on incomplete data.
+    const seasonClosed = await closeSeasonIfComplete(env, season, bootstrap, prevId);
+    return { status: "ok", last_gw: prevId, season_closed: seasonClosed };
   }
 
   return { status: "partial", processed: processedCount, total: allEntryIds.length, last_gw: prevId };

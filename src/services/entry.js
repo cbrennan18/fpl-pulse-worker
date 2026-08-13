@@ -1,4 +1,4 @@
-import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kHealthStateSummary } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kHealthStateSummary, isSeasonClosed } from '../lib/kv.js';
 import { fetchJsonWithRetry } from '../lib/fpl-api.js';
 import { log } from '../lib/utils.js';
 import { getEffectiveSeason } from './harvest.js';
@@ -6,6 +6,10 @@ import { getEffectiveSeason } from './harvest.js';
 // === Build a single entry season blob ===
 // (summary + history + transfers + picks 1..targetGW)
 export async function processEntryOnce(entryId, season, kv) {
+  // One guard covers all four state writes below plus the blob write. Checked before the
+  // state read so a closed season costs one KV read and no FPL subrequests.
+  if (await isSeasonClosed(kv, season)) return { ok: false, reason: "season_closed", entryId };
+
   const nowIso = new Date().toISOString();
   const stateKey = kEntryState(entryId, season);
   const seasonKey = kEntrySeason(entryId, season);
@@ -215,6 +219,13 @@ export const RETRY_COOLDOWN_MS = 60 * 60 * 1000; // 1 hour
 
 export async function retryErroredEntries(env) {
   const season = await getEffectiveSeason(env);
+  // Guarded at the top rather than per-entry: this also freezes the errored → dead
+  // transition, which is correct. An entry still errored at close has been failing for
+  // months across three attempts and hourly retries; one more pass at the buzzer will not
+  // fix it, and dead-lettering it would be a write to a closed season purely for tidiness.
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) {
+    return { retried: 0, succeeded: 0, eligible: 0, reason: "season_closed" };
+  }
   const candidates = [];
   let cursor;
 
@@ -297,6 +308,9 @@ export const MAX_QUEUED_PER_CYCLE = 5;
 
 export async function processQueuedEntries(env) {
   const season = await getEffectiveSeason(env);
+  if (await isSeasonClosed(env.FPL_PULSE_KV, season)) {
+    return { processed: 0, succeeded: 0, eligible: 0, reason: "season_closed" };
+  }
   const candidates = [];
   let cursor;
 

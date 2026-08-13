@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { detectSeasonFromAPI, getEffectiveSeason, detectLatestFinishedGW } from '../src/services/harvest.js';
+import { detectSeasonFromAPI, getEffectiveSeason, detectLatestFinishedGW, detectFinalGW, harvestIfNeeded } from '../src/services/harvest.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
-import { kDetectedSeason } from '../src/lib/kv.js';
+import { kDetectedSeason, kSeasonClosed, kSeasonElements, kSeasonBootstrap, kSnapshotCurrent, isSeasonClosed } from '../src/lib/kv.js';
 import { fallbackSeason, parseSeasonToken, MIN_SEASON, maxSeason } from '../src/lib/utils.js';
 import { createMockEnv, mockFetch, createBootstrap } from './helpers/mocks.js';
 
@@ -275,5 +275,118 @@ describe('detectLatestFinishedGW', () => {
     });
 
     expect(detectLatestFinishedGW(bootstrap)).toBeNull();
+  });
+});
+
+describe('detectFinalGW', () => {
+  // events.length and the max event id coincide in a normal 38-GW season and diverge the
+  // moment FPL reshapes the event list — which is why the close trigger uses the max id.
+  it('returns the highest event id, not the event count', () => {
+    expect(detectFinalGW({ events: [{ id: 1 }, { id: 2 }, { id: 38 }] })).toBe(38);
+  });
+
+  it('returns null for an empty or missing event list', () => {
+    expect(detectFinalGW({ events: [] })).toBeNull();
+    expect(detectFinalGW(null)).toBeNull();
+  });
+
+  it('ignores non-numeric ids', () => {
+    expect(detectFinalGW({ events: [{ id: 1 }, { id: 'x' }, { id: 3 }] })).toBe(3);
+  });
+});
+
+describe('season close via harvestIfNeeded', () => {
+  const BOOT = 'https://fantasy.premierleague.com/api/bootstrap-static/';
+  const liveUrl = (gw) => `https://fantasy.premierleague.com/api/event/${gw}/live/`;
+  const live = (gw) => ({ elements: [{ id: 1, stats: { total_points: gw } }] });
+
+  // n events; the first `finished` of them are complete.
+  const boot = (n, finished) => ({
+    events: Array.from({ length: n }, (_, i) => ({
+      id: i + 1,
+      deadline_time: '2025-08-16T17:30:00Z',
+      finished: i < finished,
+      data_checked: i < finished,
+    })),
+  });
+
+  const routes = (n, finished) => {
+    const r = { [BOOT]: boot(n, finished) };
+    for (let gw = 1; gw <= n; gw++) r[liveUrl(gw)] = live(gw);
+    return r;
+  };
+
+  let env;
+  let cleanup;
+
+  beforeEach(async () => {
+    circuitBreaker.reset();
+    env = createMockEnv();
+    await env.FPL_PULSE_KV.put(kDetectedSeason, JSON.stringify({
+      season: 2025, detected_at: new Date().toISOString(),
+    }));
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  // THE ORDERING PROPERTY. The harvest that processes the final gameweek is itself a write
+  // to the season being closed, so the close must not gate the work that triggers it. If
+  // the marker were stamped first, backfillSeasonElements would have refused and the
+  // elements spine would be empty — so asserting the spine WAS written proves the harvest
+  // completed before the close landed.
+  it('completes the final gameweek harvest, then stamps the marker', async () => {
+    cleanup = mockFetch(routes(3, 3));
+
+    const res = await harvestIfNeeded(env);
+    expect(res.status).toBe('ok');
+    expect(res.season_closed).toBe(true);
+
+    const elements = env.FPL_PULSE_KV._getJSON(kSeasonElements(2025));
+    expect(elements.gws['3']).toBeTruthy();
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonBootstrap(2025))).not.toBeNull();
+    expect(env.FPL_PULSE_KV._getJSON(kSnapshotCurrent)).toEqual({ season: 2025, last_gw: 3 });
+
+    const marker = env.FPL_PULSE_KV._getJSON(kSeasonClosed(2025));
+    expect(marker.final_gw).toBe(3);
+    expect(marker.closed_at).toBeTruthy();
+  });
+
+  it('does not close while gameweeks remain', async () => {
+    cleanup = mockFetch(routes(3, 2));
+
+    const res = await harvestIfNeeded(env);
+    expect(res.status).toBe('ok');
+    expect(res.season_closed).toBe(false);
+    expect(await isSeasonClosed(env.FPL_PULSE_KV, 2025)).toBe(false);
+  });
+
+  it('the next cron tick after close no-ops before any write', async () => {
+    cleanup = mockFetch(routes(3, 3));
+    await harvestIfNeeded(env);
+
+    const before = JSON.stringify(env.FPL_PULSE_KV._getJSON(kSeasonElements(2025)));
+    const res = await harvestIfNeeded(env);
+
+    expect(res).toMatchObject({ status: 'noop', reason: 'season_closed' });
+    expect(JSON.stringify(env.FPL_PULSE_KV._getJSON(kSeasonElements(2025)))).toBe(before);
+  });
+
+  // A partial harvest never reaches updateSnapshot, so it cannot reach the close either —
+  // a season can never close on incomplete data.
+  it('closes idempotently and does not re-stamp a reopened season', async () => {
+    cleanup = mockFetch(routes(3, 3));
+    await harvestIfNeeded(env);
+    const first = env.FPL_PULSE_KV._getJSON(kSeasonClosed(2025));
+
+    // Reopen, then let the cron run again: the snapshot already names the final GW, so
+    // harvest exits at already_up_to_date and the reopen sticks.
+    await env.FPL_PULSE_KV.delete(kSeasonClosed(2025));
+    const res = await harvestIfNeeded(env);
+
+    expect(res).toMatchObject({ status: 'noop', reason: 'already_up_to_date' });
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonClosed(2025))).toBeNull();
+    expect(first.final_gw).toBe(3);
   });
 });

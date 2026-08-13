@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { archiveLeagueStandings, archiveAllLeagueStandings, standingsProvenance } from '../src/services/harvest.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
-import { kLeagueStandings, kLeagueMembers, kSeasonBootstrap, kDetectedSeason, isLeagueStandings } from '../src/lib/kv.js';
+import { kLeagueStandings, kLeagueMembers, kSeasonBootstrap, kSeasonClosed, kDetectedSeason, isLeagueStandings } from '../src/lib/kv.js';
 import { createMockEnv, mockFetch } from './helpers/mocks.js';
 
 const BOOT = 'https://fantasy.premierleague.com/api/bootstrap-static/';
@@ -464,5 +464,64 @@ describe('isFinal derivation', () => {
 
     const res = await archiveAllLeagueStandings(env, 2025, {});
     expect(res.final).toBe(false);
+  });
+});
+
+// Flag ④: the archive is EXEMPT from season immutability. Close fires at final-gameweek-
+// finished, and the archive's entire purpose is to capture standings after that, in the
+// window before FPL's rollover — gating it would make it unrunnable exactly when needed.
+// Its own write-once `final` guard and the provenance gate are the correct protections.
+describe('archiveLeagueStandings after season close', () => {
+  let env;
+  let cleanup;
+
+  beforeEach(async () => {
+    circuitBreaker.reset();
+    env = createMockEnv({
+      [kLeagueMembers(111, 2025)]: JSON.stringify([1, 2]),
+      [kSeasonBootstrap(2025)]: JSON.stringify(completeBootstrap()),
+    });
+    await env.FPL_PULSE_KV.put(kSeasonClosed(2025), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  it('still writes the final table for a closed season', async () => {
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.summary.written).toBe(1);
+
+    const stored = env.FPL_PULSE_KV._getJSON(kLeagueStandings(111, 2025));
+    expect(stored.final).toBe(true);
+    expect(isLeagueStandings(stored)).toBe(true);
+  });
+
+  // Three guards, three jobs. Close stops the harvest rewriting the season; write-once
+  // stops a later archive run replacing a captured final table with a post-rollover reset
+  // one; provenance stops a different league's table being written at all.
+  it('write-once still refuses to clobber a final table on a closed season', async () => {
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'L111', [row(1, 1, 100)]),
+    });
+
+    await archiveAllLeagueStandings(env, 2025, {});
+    const second = await archiveAllLeagueStandings(env, 2025, {});
+    expect(second.summary.written).toBe(0);
+    expect(second.summary.skipped).toBe(1);
+  });
+
+  it('provenance still refuses a stranger\'s table on a closed season', async () => {
+    cleanup = mockFetch({
+      [standingsUrl(111)]: standingsPage(111, 'Other', [row(900001, 1, 2100), row(900002, 2, 2000)]),
+    });
+
+    const res = await archiveAllLeagueStandings(env, 2025, {});
+    expect(res.summary.refused).toBe(1);
+    expect(env.FPL_PULSE_KV._getJSON(kLeagueStandings(111, 2025))).toBeNull();
   });
 });

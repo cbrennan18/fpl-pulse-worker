@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { processEntryOnce } from '../src/services/entry.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
-import { kEntryState, kEntrySeason } from '../src/lib/kv.js';
+import { kEntryState, kEntrySeason, kSeasonClosed } from '../src/lib/kv.js';
 import { createMockKV, mockFetch } from './helpers/mocks.js';
 
 const SEASON = 2025;
@@ -250,5 +250,48 @@ describe('processEntryOnce', () => {
     // The existing GW1 picks should be preserved (our custom element: 99)
     const blob = kv._getJSON(kEntrySeason(ENTRY_ID, SEASON));
     expect(blob.picks_by_gw[1].picks[0].element).toBe(99);
+  });
+});
+
+describe('processEntryOnce — season immutability', () => {
+  let kv;
+  let cleanup;
+
+  beforeEach(() => {
+    circuitBreaker.reset();
+    kv = createMockKV();
+    cleanup = mockFetch(fplMockRoutes());
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  it('refuses to build an entry for a closed season, leaving state untouched', async () => {
+    await kv.put(kEntryState(ENTRY_ID, SEASON), JSON.stringify({ status: 'queued', attempts: 0 }));
+    await kv.put(kSeasonClosed(SEASON), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+
+    const result = await processEntryOnce(ENTRY_ID, SEASON, kv);
+    expect(result.ok).toBe(false);
+    expect(result.reason).toBe('season_closed');
+
+    // Not even the queued -> building transition is written.
+    expect(kv._getJSON(kEntryState(ENTRY_ID, SEASON))).toEqual({ status: 'queued', attempts: 0 });
+    expect(kv._getJSON(kEntrySeason(ENTRY_ID, SEASON))).toBeNull();
+  });
+
+  it('builds normally when no marker exists — absence means open', async () => {
+    await kv.put(kEntryState(ENTRY_ID, SEASON), JSON.stringify({ status: 'queued', attempts: 0 }));
+
+    const result = await processEntryOnce(ENTRY_ID, SEASON, kv);
+    expect(result.ok).toBe(true);
+    expect(kv._getJSON(kEntrySeason(ENTRY_ID, SEASON))).not.toBeNull();
+  });
+
+  it('a marker on a DIFFERENT season does not block this one', async () => {
+    await kv.put(kEntryState(ENTRY_ID, SEASON), JSON.stringify({ status: 'queued', attempts: 0 }));
+    await kv.put(kSeasonClosed(2024), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+
+    expect((await processEntryOnce(ENTRY_ID, SEASON, kv)).ok).toBe(true);
   });
 });

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { retryErroredEntries, processQueuedEntries, updateHealthStateSummary, MAX_RETRY_ATTEMPTS, MAX_QUEUED_PER_CYCLE, RETRY_COOLDOWN_MS } from '../src/services/entry.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
-import { kEntryState, kEntrySeason, kDetectedSeason, kHealthStateSummary } from '../src/lib/kv.js';
+import { kEntryState, kEntrySeason, kDetectedSeason, kHealthStateSummary, kSeasonClosed } from '../src/lib/kv.js';
 import { createMockEnv, mockFetch } from './helpers/mocks.js';
 
 const SEASON = 2025;
@@ -382,5 +382,69 @@ describe('processQueuedEntries', () => {
 
     const state = JSON.parse(await env.FPL_PULSE_KV.get(kEntryState(400, SEASON)));
     expect(state.status).toBe("errored");
+  });
+});
+
+describe('cron entry paths — season immutability', () => {
+  let env;
+  let cleanup;
+
+  beforeEach(async () => {
+    circuitBreaker.reset();
+    env = createMockEnv();
+    await seedSeason(env);
+    await env.FPL_PULSE_KV.put(kSeasonClosed(SEASON), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  it('retryErroredEntries no-ops without touching an eligible errored entry', async () => {
+    const errored = {
+      status: 'errored',
+      error: 'boom',
+      attempts: 1,
+      updated_at: new Date(Date.now() - 2 * RETRY_COOLDOWN_MS).toISOString(),
+    };
+    await seedEntryState(env, 1, errored);
+
+    const res = await retryErroredEntries(env);
+    expect(res).toMatchObject({ retried: 0, succeeded: 0, reason: 'season_closed' });
+    expect(env.FPL_PULSE_KV._getJSON(kEntryState(1, SEASON))).toEqual(errored);
+  });
+
+  // The errored -> dead transition is frozen too. An entry at max attempts stays errored
+  // rather than being dead-lettered, because dead-lettering is a write to a closed season.
+  it('does not dead-letter an entry that has exhausted its retries', async () => {
+    const exhausted = {
+      status: 'errored',
+      error: 'boom',
+      attempts: MAX_RETRY_ATTEMPTS,
+      updated_at: new Date(Date.now() - 2 * RETRY_COOLDOWN_MS).toISOString(),
+    };
+    await seedEntryState(env, 2, exhausted);
+
+    await retryErroredEntries(env);
+    expect(env.FPL_PULSE_KV._getJSON(kEntryState(2, SEASON)).status).toBe('errored');
+  });
+
+  it('processQueuedEntries no-ops without building a queued entry', async () => {
+    await seedEntryState(env, 3, { status: 'queued', last_gw_processed: 0 });
+
+    const res = await processQueuedEntries(env);
+    expect(res).toMatchObject({ processed: 0, succeeded: 0, reason: 'season_closed' });
+    expect(env.FPL_PULSE_KV._getJSON(kEntrySeason(3, SEASON))).toBeNull();
+    expect(env.FPL_PULSE_KV._getJSON(kEntryState(3, SEASON)).status).toBe('queued');
+  });
+
+  // Observability is not season data: the summary must keep reporting through the closed
+  // window, otherwise an operator loses sight of exactly the entries frozen mid-flight.
+  it('still updates the health state summary', async () => {
+    await seedEntryState(env, 4, { status: 'errored', attempts: 1 });
+
+    const summary = await updateHealthStateSummary(env);
+    expect(summary.errored).toBe(1);
+    expect(env.FPL_PULSE_KV._getJSON(kHealthStateSummary)).not.toBeNull();
   });
 });

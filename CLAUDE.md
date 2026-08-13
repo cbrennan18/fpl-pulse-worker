@@ -61,6 +61,7 @@ league:<id>:<season>:standings    # Archived FINAL classic standings (write-once
 snapshot:current                  # Last processed GW info
 heartbeat:<iso-timestamp>         # Cron liveness marker
 health:state_summary              # Precomputed entry state counts (updated hourly by cron)
+season:<year>:closed              # Season immutability marker: { closed_at, final_gw }. PRESENCE = closed
 config:detected_season            # Auto-detected season from FPL API (1h cache)
 cache:purge_queue                 # Pending edge-cache URLs to delete (queue drained by processPurgeQueue each cron cycle)
 idempotency:<key>                 # Cached admin operation results (1h TTL)
@@ -105,14 +106,69 @@ reporting them under `protected`. Archival classes:
 `entry:<id>:<season>:state` is deliberately **not** archival. It is build scaffolding: no
 read route serves it, and `public.js` consults it only when the blob is missing, where
 `errored`/`dead`/`complete` all 404 exactly as an absent key does. At one state per entry
-per season it is the bulk of the old-season namespace, so `old_season` still has real work.
+per season it is the bulk of the old-season namespace, so the cleanup target still has real
+work to do.
 
-> **For Stage 4 (cleanup-target rename).** With the guard in place, `old_season` now means
-> "delete old seasons' build scaffolding" — which is not what the name says. That is the
-> same objection that motivated the guard itself: two unlike intents sharing one target
-> name, where `confirm_count` cannot tell them apart because the operator just types back
-> whatever number the dry run produced. Renaming is Stage 4's call, deliberately not done
-> here.
+`season:<year>:closed` is archival too — deleting it silently reopens a season.
+
+**The cleanup target is `closed_season`, not `old_season`.** `old_season` was a guess from
+recency ("not the season we currently detect"); `closed_season` is a recorded fact. It
+deletes non-archival, non-current keys belonging to a season with a close marker, so a
+season that never completed is never a deletion candidate — close it deliberately first.
+`old_season` is accepted as a deprecated alias rather than broken, because the change is
+strictly **narrowing**: a closed season is always also an old one, so no existing script can
+be made to delete something it would not have deleted before. Responses carry
+`skipped_not_closed` so it is visible when keys were passed over for want of a marker.
+
+### Season immutability
+
+A season is **closed** when `season:<year>:closed` exists. **Absence means open, always** —
+this is the load-bearing default: every write path consults it, and the whole test suite
+runs without seeding a marker. Closure is never inferred live from bootstrap, which would
+flip mid-flight and cost every writer a `fetchBootstrap` against the 50-subrequest budget.
+One KV read to check; KV ops don't count against that budget.
+
+**Stamped in exactly one place:** the tail of `harvestIfNeeded`, after the harvest that
+processed the final gameweek has completed and advanced the snapshot. That ordering is the
+point — the harvest which triggers the close is itself a write to the season, so the close
+cannot gate the work that causes it. A partial harvest never reaches `updateSnapshot`, so a
+season can never close on incomplete data. The trigger compares the latest finished GW to
+`detectFinalGW` (the **max event id**, not `events.length` — they coincide in a normal
+38-GW season and diverge the moment FPL reshapes the event list).
+
+**Blocked writes answer differently by caller.** Cron paths return `{reason: "season_closed"}`
+and log **nothing** — this fires hourly forever once a season closes, and the marker is the
+durable record of why. The one logged event is the close itself. Admin write endpoints
+return **409** with the reopen instructions, because an operator issuing a write deserves
+to be told why it did nothing.
+
+**Gated:** `appendElementsForGW`, `backfillSeasonElements`, `updateEntryForGW`,
+`updateSnapshot`, `harvestIfNeeded`, `processEntryOnce`, `retryErroredEntries`,
+`processQueuedEntries`, and the eight admin write endpoints listed in `isSeasonWritePath`.
+**Not gated:** `archiveLeagueStandings` (see below), `updateHealthStateSummary` (writes a
+global observability key, and must keep reporting through the closed window).
+
+**Reopening.** `POST /admin/season/<year>/reopen` deletes the marker; `POST
+/admin/season/<year>/close` restores it. Both require `confirm_season` echoed in the body,
+and reopen logs at WARN. Both exist because a reopen without a matching close would leave
+the season permanently mutable — worse than the state being repaired. Repair flow: reopen →
+fix → re-close. A reopen is not silently undone by the cron: after it, the snapshot still
+names the final gameweek, so `harvestIfNeeded` exits at `already_up_to_date` before
+reaching the close.
+
+**A season that never completes stays open.** FPL curtailed 2019/20; a curtailed or
+reshaped event list means the automatic trigger never fires. That is the correct default —
+an unclosed old season is already functionally frozen (the cron only ever addresses the
+detected season) and its archive is still protected by the `archival` guard. `POST
+/admin/season/<year>/close` is the deliberate way out.
+
+**Entries left `errored` at close stay errored.** `retryErroredEntries` owns the
+errored → dead transition, so freezing it freezes that too. Deliberate: an entry still
+failing at the final gameweek has failed for months across three attempts and hourly
+retries, and dead-lettering it would be a write to a closed season purely for tidiness. A
+final retry sweep was considered and rejected — it would put network-bound, partially-failing
+work on the close path, and then the close would have to decide whether to proceed anyway.
+The health summary keeps reporting them until rollover, which is the visibility you want.
 
 ### Archive writes are provenance-gated
 
@@ -143,17 +199,18 @@ means no evidence, which yields `false` — safe, since a non-final archive stay
 and is never served at 200. This also removed the run's only live bootstrap fetch, so the
 subrequest budget now starts at 0.
 
-**Three guards, three different jobs — do not collapse them as redundant:**
+**Four guards, four different jobs — do not collapse them as redundant:**
 
 | Guard | Protects against |
 |---|---|
 | ③ scan predicate (`archiveAllLeagueStandings`) | Picking up an old season's league id from a season-blind `*:members` scan. Filters *which leagues are attempted* |
 | Provenance overlap (`archiveLeagueStandings`) | The fetched *table* belonging to a different league or season. Filters *what gets written* |
 | Write-once `final` | A later run replacing a captured final table with a post-rollover reset one. Filters *overwrites* |
+| Closed-season gate exemption | Nothing — the archive is deliberately **exempt**, because its whole purpose is to run after close |
 
 The ③ predicate does not help when a league is named explicitly via `leagueId`, which
 bypasses the scan. Provenance does not help decide whether a table is final. Write-once does
-not help the first write.
+not help the first write. The exemption is why the other three must hold.
 
 ## Entry State Machine
 
@@ -189,7 +246,9 @@ All require authentication via `X-Refresh-Token` header.
 | `/admin/backfill?single=true&entry=N` | POST | Single entry sync test |
 | `/admin/backfill?limit=N&leagueId=L` | POST | Batch process queued entries |
 | `/admin/kv/audit` | GET | Full KV namespace audit with categorization and issue detection. `issues.old_season_keys` are deletable; `issues.archival_keys` are refused by cleanup |
-| `/admin/kv/cleanup` | POST | Targeted KV cleanup (`{"dry_run": true, "targets": ["old_season"\|"orphaned_entries"], "confirm_count": N}`). **Refuses archival keys** — see Seasons above |
+| `/admin/kv/cleanup` | POST | Targeted KV cleanup (`{"dry_run": true, "targets": ["closed_season"\|"orphaned_entries"], "confirm_count": N}`). **Refuses archival keys**, and `closed_season` only touches seasons with a recorded close marker. `old_season` is a deprecated alias |
+| `/admin/season/:year/close` | POST | Manually close a season (body `{confirm_season}`, optional `final_gw`). For a curtailed season the automatic trigger never fires on |
+| `/admin/season/:year/reopen` | POST | Override immutability for a repair (body `{confirm_season}`). Logs at WARN. Re-close when done |
 | `/admin/kv/migrate-members` | POST | One-off copy of legacy `league:<id>:members` → `league:<id>:<season>:members`. `season` required (never defaulted), `dry_run` default true, **copies without deleting**. Blocks any key with no entry-blob or entry-state footprint in the season being stamped; `allow_unverified: true` overrides |
 
 **Idempotency:** POST endpoints support `X-Idempotency-Key` header. Duplicate requests within 1h return cached response with `X-Idempotency-Cached: true`.
@@ -288,7 +347,7 @@ Step 3 is what reclaims the complexity; steps 1–2 reclaim the budget. They can
 ## Commands
 
 ```bash
-npx vitest run          # Run test suite (172 tests)
+npx vitest run          # Run test suite (216 tests)
 npx wrangler dev        # Local development server
 npx wrangler deploy     # Deploy to Cloudflare
 ```

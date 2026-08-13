@@ -2,6 +2,7 @@ import { describe, it, expect, beforeEach } from 'vitest';
 import { handleAdminRoute } from '../src/routes/admin.js';
 import {
   kLeagueMembers, kLeagueStandings, kSeasonBootstrap, kSeasonElements, kEntrySeason, kEntryState,
+  kSeasonClosed,
 } from '../src/lib/kv.js';
 import { createMockEnv } from './helpers/mocks.js';
 
@@ -75,11 +76,14 @@ describe('GET /admin/kv/audit — key categorisation', () => {
   });
 });
 
-describe('POST /admin/kv/cleanup — archive guard on the old_season target', () => {
+describe('POST /admin/kv/cleanup — closed_season target', () => {
   let env;
 
   beforeEach(() => {
     env = createMockEnv({
+      // Season OLD is RECORDED closed. Without this marker none of its keys are
+      // candidates at all — the target keys off recorded state, not recency.
+      [kSeasonClosed(OLD)]: JSON.stringify({ closed_at: '2025-05-25T18:00:00.000Z', final_gw: 38 }),
       // Deletable: build scaffolding. No read route serves entry state, and when the
       // blob is absent public.js 404s for `complete` exactly as for a missing key.
       [kEntryState(77, OLD)]: JSON.stringify({ status: 'complete' }),
@@ -97,9 +101,9 @@ describe('POST /admin/kv/cleanup — archive guard on the old_season target', ()
     });
   });
 
-  it('dry run offers only non-archival old-season keys, and names the refusals', async () => {
+  it('dry run offers only non-archival keys of a closed season, and names the refusals', async () => {
     const body = await (await adminPost(env, '/admin/kv/cleanup', {
-      targets: ['old_season'],
+      targets: ['closed_season'],
     })).json();
 
     // Entry state is the bulk of the old-season namespace, so the target keeps a job.
@@ -122,7 +126,7 @@ describe('POST /admin/kv/cleanup — archive guard on the old_season target', ()
 
   it('a real run deletes the scaffolding and leaves every archive key in KV', async () => {
     const res = await adminPost(env, '/admin/kv/cleanup', {
-      targets: ['old_season'],
+      targets: ['closed_season'],
       dry_run: false,
       confirm_count: 2,
     });
@@ -145,7 +149,7 @@ describe('POST /admin/kv/cleanup — archive guard on the old_season target', ()
   it('confirm_count counts only the deletable keys, not the protected ones', async () => {
     // 7 would be the pre-guard candidate count; supplying it must be rejected.
     const res = await adminPost(env, '/admin/kv/cleanup', {
-      targets: ['old_season'],
+      targets: ['closed_season'],
       dry_run: false,
       confirm_count: 7,
     });
@@ -296,5 +300,202 @@ describe('POST /admin/kv/migrate-members', () => {
       expect(body.summary.copied).toBe(1);
       expect(body.results[0].provenance.blob_ratio).toBeNull();
     });
+  });
+});
+
+describe('admin season immutability gate', () => {
+  let env;
+
+  const closed = () => env.FPL_PULSE_KV.put(
+    kSeasonClosed(CURRENT), JSON.stringify({ closed_at: '2026-05-25T18:00:00.000Z', final_gw: 38 })
+  );
+
+  beforeEach(() => { env = createMockEnv(); });
+
+  // Every endpoint that writes season-scoped data. Listed explicitly so a new writer added
+  // without a gate shows up here as a gap rather than silently corrupting an archive.
+  const writePaths = [
+    ['/admin/entries/states/bulk', { action: 'requeue', entry_ids: [1] }],
+    ['/admin/entries/states/bulk', { action: 'purge', entry_ids: [1] }],
+    ['/admin/dead/revive', {}],
+    ['/admin/backfill', {}],
+    ['/admin/season/elements/backfill', {}],
+    ['/admin/entries/1/revive', {}],
+    ['/admin/entry/1/force-rebuild', {}],
+    ['/admin/entry/1/enqueue', {}],
+    ['/admin/league/9385/ingest', {}],
+  ];
+
+  it.each(writePaths)('refuses %s with 409 when the season is closed', async (path, body) => {
+    await closed();
+    const res = await adminPost(env, path, body);
+    expect(res.status).toBe(409);
+
+    const json = await res.json();
+    expect(json.error).toBe('season_closed');
+    expect(json.closed_at).toBe('2026-05-25T18:00:00.000Z');
+    expect(json.message).toContain('/admin/season/2025/reopen');
+  });
+
+  it('leaves the standings archive endpoint reachable — it exists to run after close', async () => {
+    await closed();
+    // Not a 409. It proceeds to the archive logic, which fails only on the absent fetch mock.
+    const res = await adminPost(env, '/admin/standings/archive', { season: CURRENT });
+    expect(res.status).not.toBe(409);
+  });
+
+  it('does not gate read-only or cross-season endpoints', async () => {
+    await closed();
+    expect((await adminGet(env, '/admin/kv/audit')).status).toBe(200);
+    expect((await adminPost(env, '/admin/kv/cleanup', { targets: ['closed_season'] })).status).toBe(200);
+  });
+
+  it('permits every write path while the season is open', async () => {
+    const res = await adminPost(env, '/admin/entry/1/enqueue', {});
+    expect(res.status).toBe(200);
+  });
+});
+
+describe('POST /admin/season/:year/{close,reopen}', () => {
+  let env;
+
+  beforeEach(() => { env = createMockEnv(); });
+
+  it('requires confirm_season to match', async () => {
+    const res = await adminPost(env, `/admin/season/${OLD}/close`, { confirm_season: 1999 });
+    expect(res.status).toBe(409);
+    expect((await res.json()).error).toBe('confirm_season_required');
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonClosed(OLD))).toBeNull();
+  });
+
+  it('rejects a malformed season in the path', async () => {
+    const res = await adminPost(env, '/admin/season/12345/close', { confirm_season: 12345 });
+    expect(res.status).toBe(400);
+    expect((await res.json()).error).toBe('invalid_season');
+  });
+
+  // The way out of "the season never completes" — a curtailed or reshaped event list means
+  // the automatic trigger never fires.
+  it('closes a season that never closed on its own', async () => {
+    const res = await adminPost(env, `/admin/season/${OLD}/close`, { confirm_season: OLD, final_gw: 29 });
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe('closed');
+
+    const marker = env.FPL_PULSE_KV._getJSON(kSeasonClosed(OLD));
+    expect(marker).toMatchObject({ final_gw: 29, closed_by: 'admin' });
+  });
+
+  it('is idempotent — closing twice does not restamp closed_at', async () => {
+    await adminPost(env, `/admin/season/${OLD}/close`, { confirm_season: OLD });
+    const first = env.FPL_PULSE_KV._getJSON(kSeasonClosed(OLD));
+
+    const res = await adminPost(env, `/admin/season/${OLD}/close`, { confirm_season: OLD });
+    expect((await res.json()).status).toBe('already_closed');
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonClosed(OLD)).closed_at).toBe(first.closed_at);
+  });
+
+  it('reopen removes the marker and restores writability', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonClosed(CURRENT), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+    expect((await adminPost(env, '/admin/entry/1/enqueue', {})).status).toBe(409);
+
+    const res = await adminPost(env, `/admin/season/${CURRENT}/reopen`, { confirm_season: CURRENT });
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe('reopened');
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonClosed(CURRENT))).toBeNull();
+
+    // The repair the reopen exists to enable is now possible.
+    expect((await adminPost(env, '/admin/entry/1/enqueue', {})).status).toBe(200);
+  });
+
+  it('reopening an open season is a no-op, not an error', async () => {
+    const res = await adminPost(env, `/admin/season/${OLD}/reopen`, { confirm_season: OLD });
+    expect(res.status).toBe(200);
+    expect((await res.json()).status).toBe('already_open');
+  });
+});
+
+describe('cleanup target: closed_season vs the old_season alias', () => {
+  let env;
+
+  // Two closed-season scaffolding keys and two from a season that never closed.
+  const seed = (closeIt) => {
+    const kv = {
+      [kEntryState(1, OLD)]: JSON.stringify({ status: 'complete' }),
+      [kEntryState(2, OLD)]: JSON.stringify({ status: 'errored' }),
+      [kEntryState(3, 2019)]: JSON.stringify({ status: 'complete' }),
+    };
+    if (closeIt) kv[kSeasonClosed(OLD)] = JSON.stringify({ closed_at: 'x', final_gw: 38 });
+    return createMockEnv(kv);
+  };
+
+  it('offers nothing for a season that has no close marker', async () => {
+    env = seed(false);
+    const body = await (await adminPost(env, '/admin/kv/cleanup', { targets: ['closed_season'] })).json();
+
+    expect(body.would_delete_count).toBe(0);
+    expect(body.skipped_not_closed_count).toBe(3);
+    expect(body.skipped_not_closed.every(s => s.reason === 'season_not_closed')).toBe(true);
+  });
+
+  // FPL curtailed 2019/20. A season that never completes stays open, so its keys are never
+  // deletion candidates until someone deliberately closes it.
+  it('leaves a never-closed season alone while cleaning a closed one', async () => {
+    env = seed(true);
+    const body = await (await adminPost(env, '/admin/kv/cleanup', { targets: ['closed_season'] })).json();
+
+    expect(body.would_delete.map(d => d.key).sort()).toEqual([kEntryState(1, OLD), kEntryState(2, OLD)].sort());
+    expect(body.skipped_not_closed.map(s => s.key)).toEqual([kEntryState(3, 2019)]);
+  });
+
+  it('the manual close route makes a curtailed season cleanable', async () => {
+    env = seed(true);
+    await adminPost(env, '/admin/season/2019/close', { confirm_season: 2019, final_gw: 29 });
+
+    const body = await (await adminPost(env, '/admin/kv/cleanup', { targets: ['closed_season'] })).json();
+    expect(body.would_delete_count).toBe(3);
+    expect(body.skipped_not_closed_count).toBe(0);
+  });
+
+  // Accepted, not broken: the change is strictly narrowing, so no existing script can be
+  // made to delete something it would not have deleted before.
+  it('accepts the deprecated old_season alias and says so', async () => {
+    env = seed(true);
+    const body = await (await adminPost(env, '/admin/kv/cleanup', { targets: ['old_season'] })).json();
+
+    expect(body.would_delete_count).toBe(2);
+    expect(body.deprecations[0]).toContain('old_season');
+    expect(body.deprecations[0]).toContain('closed_season');
+  });
+
+  it('rejects an unknown target and lists the current valid ones', async () => {
+    env = seed(true);
+    const res = await adminPost(env, '/admin/kv/cleanup', { targets: ['nonsense'] });
+    expect(res.status).toBe(400);
+    expect((await res.json()).valid).toEqual(['closed_season', 'orphaned_entries']);
+  });
+
+  it('never offers the close marker itself for deletion', async () => {
+    env = seed(true);
+    const body = await (await adminPost(env, '/admin/kv/cleanup', { targets: ['closed_season'] })).json();
+    expect(body.would_delete.some(d => d.key === kSeasonClosed(OLD))).toBe(false);
+  });
+});
+
+describe('GET /admin/kv/audit — closed state', () => {
+  it('reports closed state per season alongside the categorisation', async () => {
+    const env = createMockEnv({
+      [kEntryState(1, OLD)]: JSON.stringify({ status: 'complete' }),
+      [kEntryState(2, CURRENT)]: JSON.stringify({ status: 'complete' }),
+      [kEntryState(3, 2019)]: JSON.stringify({ status: 'complete' }),
+      [kSeasonClosed(OLD)]: JSON.stringify({ closed_at: '2025-05-25T18:00:00.000Z', final_gw: 38 }),
+    });
+
+    const body = await (await adminGet(env, '/admin/kv/audit')).json();
+
+    expect(body.seasons[OLD]).toMatchObject({ closed: true, is_current: false, final_gw: 38 });
+    expect(body.seasons[CURRENT]).toMatchObject({ closed: false, is_current: true });
+    // The curtailed season shows as open, which is why cleanup will not touch it.
+    expect(body.seasons[2019]).toMatchObject({ closed: false });
+    expect(body.issues.unknown_keys).toEqual([]);
   });
 });

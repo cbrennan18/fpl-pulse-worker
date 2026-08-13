@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { appendElementsForGW, backfillSeasonElements } from '../src/services/harvest.js';
-import { isValidGwElements, kSeasonElements } from '../src/lib/kv.js';
+import { isValidGwElements, kSeasonElements, kSeasonClosed } from '../src/lib/kv.js';
 import { circuitBreaker } from '../src/lib/fpl-api.js';
 import { createMockEnv, mockFetch } from './helpers/mocks.js';
 
@@ -105,5 +105,36 @@ describe('backfillSeasonElements', () => {
     const res = await backfillSeasonElements(env, SEASON, 3);
     expect(res.filled).toEqual([1, 2, 3]);
     expect(env.FPL_PULSE_KV._getJSON(kSeasonElements(SEASON)).last_gw_processed).toBe(3);
+  });
+});
+
+describe('elements writes — season immutability', () => {
+  let env;
+  let cleanup;
+
+  beforeEach(async () => {
+    circuitBreaker.reset();
+    env = createMockEnv();
+    cleanup = mockFetch(liveRoutes(5));
+    await env.FPL_PULSE_KV.put(kSeasonClosed(SEASON), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+  });
+  afterEach(() => {
+    if (cleanup) cleanup();
+    circuitBreaker.reset();
+  });
+
+  it('appendElementsForGW refuses and writes nothing', async () => {
+    const res = await appendElementsForGW(env, SEASON, 1);
+    expect(res).toEqual({ wrote: false, reason: 'season_closed' });
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonElements(SEASON))).toBeNull();
+  });
+
+  it('backfillSeasonElements refuses and leaves an existing spine untouched', async () => {
+    const existing = { last_gw_processed: 2, gws: { 1: liveBlock(1), 2: liveBlock(2) } };
+    await env.FPL_PULSE_KV.put(kSeasonElements(SEASON), JSON.stringify(existing));
+
+    const res = await backfillSeasonElements(env, SEASON, 5);
+    expect(res).toMatchObject({ written: 0, reason: 'season_closed' });
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonElements(SEASON))).toEqual(existing);
   });
 });

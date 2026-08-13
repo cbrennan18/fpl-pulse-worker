@@ -1,5 +1,5 @@
-import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult, fallbackSeason } from '../lib/utils.js';
-import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
+import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult, fallbackSeason, parseSeasonToken, MIN_SEASON, maxSeason } from '../lib/utils.js';
+import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, kSeasonClosed, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { fetchJson, fetchBootstrap, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
 import { harvestIfNeeded, warmCache, processPurgeQueue, backfillSeasonElements, detectLatestFinishedGW, archiveAllLeagueStandings } from '../services/harvest.js';
@@ -12,6 +12,30 @@ const v1CacheUrls = (origin, season, suffix) => [
   `${origin}/v1${suffix}`,
   `${origin}/v1/${season}${suffix}`,
 ];
+
+// Admin endpoints that WRITE season-scoped data, and are therefore refused once the
+// season is closed. Listed centrally rather than checked in eight handlers so the set is
+// auditable in one place — the risk with per-handler checks is the one that gets missed.
+//
+// Deliberately ABSENT: /admin/standings/archive (the archive's whole purpose is to run
+// after close, in the window before FPL's rollover — its write-once `final` guard is the
+// right protection there, not this one), the read-only GETs, the cache-only purge routes,
+// /admin/kv/* (operates across seasons and has its own guards), and the close/reopen pair
+// below, which must obviously remain reachable on a closed season.
+//
+// /admin/entries/states/bulk covers BOTH its actions: `purge` deletes the entry blob,
+// which for a closed season destroys the archive outright — a stronger reason to refuse
+// than the write actions, not a weaker one.
+function isSeasonWritePath(path) {
+  if (path === "/admin/entries/states/bulk") return true;
+  if (path === "/admin/dead/revive") return true;
+  if (path === "/admin/backfill") return true;
+  if (path === "/admin/season/elements/backfill") return true;
+  if (/^\/admin\/entries\/\d+\/revive$/.test(path)) return true;
+  if (/^\/admin\/entry\/\d+\/(force-rebuild|enqueue)$/.test(path)) return true;
+  if (/^\/admin\/league\/\d+\/ingest$/.test(path)) return true;
+  return false;
+}
 
 // === KV audit helpers ===
 
@@ -91,7 +115,25 @@ function categorizeKey(keyName, currentSeason) {
     };
   }
 
+  // The immutability marker itself. Archival: deleting it silently reopens the season.
+  // Note it carries no `is_current`, so cleanup's season targets never select it.
+  const seasonClosedMarker = keyName.match(/^season:(\d+):closed$/);
+  if (seasonClosedMarker) {
+    return { type: "season_closed_marker", season: Number(seasonClosedMarker[1]), archival: true };
+  }
+
   return { type: "unknown" };
+}
+
+// Which seasons are recorded closed, read straight off the key listing the caller already
+// has. No extra KV reads: the markers are ordinary keys in the namespace.
+function closedSeasonsFrom(allKeys) {
+  const closed = new Set();
+  for (const name of allKeys) {
+    const m = name.match(/^season:(\d+):closed$/);
+    if (m) closed.add(Number(m[1]));
+  }
+  return closed;
 }
 
 // List every key in the namespace (cursor-paginated, single call for <1000 keys)
@@ -127,6 +169,23 @@ export async function handleAdminRoute(request, env, season) {
   }
   if (!isAuthorized(request, env)) return json({ error: "Unauthorized" }, 401);
 
+  // Season immutability gate. Fails fast and VISIBLY — unlike the cron paths, which no-op
+  // quietly, an operator issuing a write deserves to be told why it did nothing and how to
+  // proceed. 409 Conflict: the request is well-formed but conflicts with the season's
+  // recorded state.
+  if (isSeasonWritePath(path)) {
+    const marker = await kvGetJSON(env.FPL_PULSE_KV, kSeasonClosed(season));
+    if (marker) {
+      return json({
+        error: "season_closed",
+        message: `Season ${season} is closed and immutable. If this is a deliberate repair, reopen it with POST /admin/season/${season}/reopen, make the change, then re-close with POST /admin/season/${season}/close.`,
+        season,
+        closed_at: marker.closed_at ?? null,
+        final_gw: marker.final_gw ?? null,
+      }, 409);
+    }
+  }
+
   // Check for idempotency key (for POST requests only)
   const idempotencyKey = request.method === "POST" ? request.headers.get("X-Idempotency-Key") : null;
   if (idempotencyKey) {
@@ -143,6 +202,82 @@ export async function handleAdminRoute(request, env, season) {
         { "X-Idempotency-Cached": "true" }
       );
     }
+  }
+
+  // POST /admin/season/:year/close | /admin/season/:year/reopen
+  //
+  // The manual counterparts to the automatic close in harvestIfNeeded. Both exist because
+  // a reopen without a matching close would leave the season permanently mutable, which is
+  // a worse state than the one being repaired.
+  //
+  // `close` also covers the season that never completes on its own (see CLAUDE.md): FPL
+  // curtailed 2019/20, and a curtailed or reshaped event list means the automatic trigger
+  // never fires. Staying open is the safe default; this is the deliberate way out of it.
+  //
+  // Both require `confirm_season` echoed in the body. Reopen logs at WARN — it overrides a
+  // data-integrity guard and should surface in any log search for anomalies.
+  const seasonLifecycle = path.match(/^\/admin\/season\/(\d+)\/(close|reopen)$/);
+  if (seasonLifecycle && request.method === "POST") {
+    const targetSeason = parseSeasonToken(seasonLifecycle[1]);
+    if (targetSeason === null) {
+      return json({
+        error: "invalid_season",
+        message: `Season must be a 4-digit year between ${MIN_SEASON} and ${maxSeason()} (e.g. 2025).`,
+      }, 400);
+    }
+    const action = seasonLifecycle[2];
+
+    let body = {};
+    try {
+      const raw = await request.text();
+      if (raw) body = JSON.parse(raw);
+    } catch {
+      return json({ error: "invalid_json_body" }, 400);
+    }
+    if (Number(body.confirm_season) !== targetSeason) {
+      return json({
+        error: "confirm_season_required",
+        message: `Body must include "confirm_season": ${targetSeason} to ${action} that season.`,
+      }, 409);
+    }
+
+    const key = kSeasonClosed(targetSeason);
+    const existing = await kvGetJSON(env.FPL_PULSE_KV, key);
+
+    if (action === "close") {
+      if (existing) {
+        return json({ ok: true, status: "already_closed", season: targetSeason, ...existing }, 200);
+      }
+      const marker = {
+        closed_at: new Date().toISOString(),
+        final_gw: Number.isInteger(Number(body.final_gw)) ? Number(body.final_gw) : null,
+        closed_by: "admin",
+      };
+      await kvPutJSON(env.FPL_PULSE_KV, key, marker);
+      log.info("season", "closed", { season: targetSeason, source: "admin", final_gw: marker.final_gw });
+      const closeResult = { ok: true, status: "closed", season: targetSeason, ...marker };
+      if (idempotencyKey) await storeIdempotencyResult(env, idempotencyKey, closeResult, 200);
+      return json(closeResult, 200);
+    }
+
+    if (!existing) {
+      return json({ ok: true, status: "already_open", season: targetSeason }, 200);
+    }
+    await env.FPL_PULSE_KV.delete(key);
+    log.warn("season", "reopened", {
+      season: targetSeason,
+      was_closed_at: existing.closed_at ?? null,
+      note: "season immutability overridden — writes to this season are now permitted",
+    });
+    const reopenResult = {
+      ok: true,
+      status: "reopened",
+      season: targetSeason,
+      was_closed_at: existing.closed_at ?? null,
+      warning: "Writes to this season are now permitted. Re-close it once the repair is complete.",
+    };
+    if (idempotencyKey) await storeIdempotencyResult(env, idempotencyKey, reopenResult, 200);
+    return json(reopenResult, 200);
   }
 
   // GET /admin/entries/states — List all entry states with pagination and filtering
@@ -324,10 +459,33 @@ export async function handleAdminRoute(request, env, season) {
       if (data.old_seasons?.length === 0) delete data.old_seasons;
     }
 
+    // Closed state per season. `/admin/kv/cleanup`'s closed_season target keys off this,
+    // so an operator can see before running it which seasons are eligible — and spot a
+    // season that never closed (a curtailed or reshaped one) rather than wondering why
+    // its keys are never offered.
+    const closedSeasons = closedSeasonsFrom(allKeys);
+    const seasonsSeen = new Set();
+    for (const keyName of allKeys) {
+      const s = categorizeKey(keyName, currentSeason).season;
+      if (Number.isInteger(s)) seasonsSeen.add(s);
+    }
+    const seasons = {};
+    for (const s of [...seasonsSeen].sort()) {
+      const isClosed = closedSeasons.has(s);
+      const marker = isClosed ? await kvGetJSON(env.FPL_PULSE_KV, kSeasonClosed(s)) : null;
+      seasons[s] = {
+        closed: isClosed,
+        is_current: s === currentSeason,
+        closed_at: marker?.closed_at ?? null,
+        final_gw: marker?.final_gw ?? null,
+      };
+    }
+
     return json({
       total_keys: allKeys.length,
       current_season: currentSeason,
       league_id: leagueId ? Number(leagueId) : null,
+      seasons,
       categories,
       issues: {
         old_season_keys: oldSeasonKeys,
@@ -372,14 +530,29 @@ export async function handleAdminRoute(request, env, season) {
     const targets = body.targets;
     const confirmCount = body.confirm_count;
 
-    const validTargets = ["old_season", "orphaned_entries"];
+    // `old_season` was a guess from recency — "not the season we currently detect".
+    // `closed_season` is a recorded fact: the season carries a season:<year>:closed marker.
+    // The alias is accepted rather than broken because the semantic change is strictly
+    // NARROWING — a closed season is always also an old one, so no existing script can be
+    // made to delete something it would not have deleted before. A hard break would only
+    // produce a confusing 400 for no safety gain.
+    const TARGET_ALIASES = { old_season: "closed_season" };
+    const validTargets = ["closed_season", "orphaned_entries"];
     if (!Array.isArray(targets) || targets.length === 0) {
       return json({ error: "targets must be a non-empty array", valid: validTargets }, 400);
     }
+    const deprecations = [];
+    const resolvedTargets = [];
     for (const t of targets) {
-      if (!validTargets.includes(t)) {
+      const resolved = TARGET_ALIASES[t] ?? t;
+      if (!validTargets.includes(resolved)) {
         return json({ error: `Invalid target: ${t}`, valid: validTargets }, 400);
       }
+      if (TARGET_ALIASES[t]) {
+        deprecations.push(`target "${t}" is deprecated; use "${resolved}". It now deletes only keys of a season with a recorded close marker, which is stricter than before.`);
+        log.warn("admin", "deprecated_cleanup_target", { target: t, resolved });
+      }
+      resolvedTargets.push(resolved);
     }
 
     // Detect current season
@@ -389,7 +562,7 @@ export async function handleAdminRoute(request, env, season) {
     // Load league members for orphan detection
     const leagueId = body.league_id || env.WARM_LEAGUE_ID;
     let memberSet = null;
-    if (targets.includes("orphaned_entries")) {
+    if (resolvedTargets.includes("orphaned_entries")) {
       const members = leagueId ? await kvGetJSON(env.FPL_PULSE_KV, kLeagueMembers(leagueId, currentSeason)) : null;
       if (!Array.isArray(members)) {
         return json({ error: "Cannot detect orphans: league members not found", league_id: leagueId }, 400);
@@ -399,28 +572,38 @@ export async function handleAdminRoute(request, env, season) {
 
     // List and categorize all keys, collect deletion candidates
     const allKeys = await listAllKeys(env.FPL_PULSE_KV);
+    const closedSeasons = closedSeasonsFrom(allKeys);
     const toDelete = [];
     const protectedKeys = [];
-    const wantsOldSeason = targets.includes("old_season");
-    const wantsOrphans = targets.includes("orphaned_entries");
+    const skippedNotClosed = [];
+    const wantsClosedSeason = resolvedTargets.includes("closed_season");
+    const wantsOrphans = resolvedTargets.includes("orphaned_entries");
 
     for (const keyName of allKeys) {
       const cat = categorizeKey(keyName, currentSeason);
 
-      // Old season: entry/season keys where is_current === false
-      if (wantsOldSeason && "is_current" in cat && !cat.is_current) {
-        // ARCHIVE GUARD. Old-season league rosters, final standings and bootstrap are
-        // data FPL has already destroyed at source and that season-scoped read routes
-        // serve — they are the archive, not debris. `old_season` is a bulk target
-        // meaning "delete what we no longer need", and confirm_count cannot tell the
-        // two apart: the operator types back whatever number the dry run produced.
-        // So the refusal is structural, not a prompt. Deleting one of these must be a
-        // separate, deliberately-named operation.
+      // Closed season: season-scoped keys that are neither current nor archival, belonging
+      // to a season with a recorded close marker.
+      if (wantsClosedSeason && "is_current" in cat && !cat.is_current) {
+        // ARCHIVE GUARD. Old-season rosters, final standings, bootstrap, elements and
+        // entry blobs are data FPL has already destroyed at source and that season-scoped
+        // read routes serve — the archive, not debris. confirm_count cannot tell the two
+        // apart: the operator types back whatever number the dry run produced. So the
+        // refusal is structural, not a prompt. What remains deletable is build
+        // scaffolding, overwhelmingly entry:<id>:<season>:state.
         if (cat.archival) {
           protectedKeys.push({ key: keyName, type: cat.type, season: cat.season, reason: "archival_protected" });
           continue;
         }
-        toDelete.push({ key: keyName, type: cat.type, reason: "old_season", season: cat.season });
+        // Not merely old — KNOWN closed. A season that never completed (FPL curtailed
+        // 2019/20; a reshaped event list does the same) stays open and is therefore never
+        // a deletion candidate. Closing it is a deliberate act:
+        // POST /admin/season/<year>/close.
+        if (!closedSeasons.has(cat.season)) {
+          skippedNotClosed.push({ key: keyName, type: cat.type, season: cat.season, reason: "season_not_closed" });
+          continue;
+        }
+        toDelete.push({ key: keyName, type: cat.type, reason: "closed_season", season: cat.season });
         continue;
       }
 
@@ -445,6 +628,9 @@ export async function handleAdminRoute(request, env, season) {
         total_candidates: toDelete.length,
         protected: protectedKeys,
         protected_count: protectedKeys.length,
+        skipped_not_closed: skippedNotClosed,
+        skipped_not_closed_count: skippedNotClosed.length,
+        ...(deprecations.length ? { deprecations } : {}),
         summary: {
           by_reason: batch.reduce((acc, d) => { acc[d.reason] = (acc[d.reason] || 0) + 1; return acc; }, {}),
         },
@@ -481,6 +667,9 @@ export async function handleAdminRoute(request, env, season) {
       failed,
       protected: protectedKeys,
       protected_count: protectedKeys.length,
+      skipped_not_closed: skippedNotClosed,
+      skipped_not_closed_count: skippedNotClosed.length,
+      ...(deprecations.length ? { deprecations } : {}),
       summary: {
         total_deleted: deleted.length,
         total_failed: failed.length,

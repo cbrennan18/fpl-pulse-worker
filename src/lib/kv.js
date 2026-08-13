@@ -24,6 +24,8 @@ export const kLeagueMembers   = (leagueId, season) => `league:${leagueId}:${seas
 export const kEntrySeason     = (entryId, season) => `entry:${entryId}:${season}`;
 export const kEntryState      = (entryId, season) => `entry:${entryId}:${season}:state`;
 export const kLeagueStandings = (leagueId, season) => `league:${leagueId}:${season}:standings`;
+// Season immutability marker. PRESENCE means closed; value is { closed_at, final_gw }.
+export const kSeasonClosed    = (season) => `season:${season}:closed`;
 export const kHealthStateSummary = `health:state_summary`;
 export const kDetectedSeason = `config:detected_season`;
 export const kPurgeQueue = `cache:purge_queue`;
@@ -60,6 +62,20 @@ export const isLeagueStandings = (x) =>
   typeof x.member_count === "number" &&
   typeof x.final === "boolean" &&
   typeof x.harvested_at === "string";
+
+// === Season immutability ===
+//
+// ABSENT MEANS OPEN. ALWAYS. This is the load-bearing default of the whole mechanism:
+// every write path in the Worker consults it, and the entire existing test suite runs
+// without ever seeding a marker. If absence were ambiguous — or if closure were inferred
+// live from bootstrap instead of read from this key — every one of those paths would
+// change behaviour on a bootstrap flip mid-flight, and each would need its own
+// fetchBootstrap call against the 50-subrequest budget.
+//
+// One KV read to check, and KV operations do not count against that budget.
+export async function isSeasonClosed(kv, season) {
+  return (await kvGetJSON(kv, kSeasonClosed(season))) !== null;
+}
 
 // === Limits ===
 export const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues
