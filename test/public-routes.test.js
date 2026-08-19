@@ -3,7 +3,7 @@ import { handlePublicRoute } from '../src/routes/public.js';
 import { warmCache } from '../src/services/harvest.js';
 import {
   kEntrySeason, kEntryState, kLeagueMembers, kSeasonBootstrap, kSeasonElements,
-  kDetectedSeason, kPurgeQueue, kLeagueStandings,
+  kDetectedSeason, kPurgeQueue, kLeagueStandings, kSeasonClosed,
 } from '../src/lib/kv.js';
 import { MIN_SEASON, maxSeason } from '../src/lib/utils.js';
 import { createMockEnv, mockCaches } from './helpers/mocks.js';
@@ -353,5 +353,97 @@ describe('archived standings route', () => {
     const res = await get(env, `/v1/${ARCHIVED}/league/1373455/standings`);
     expect(res.status).toBe(200);
     expect((await res.json()).results).toHaveLength(64);
+  });
+});
+
+// GET /v1/seasons — the discovery endpoint both frontend selectors read.
+// `closed` and `has_data` are separate on purpose: Wrapped is retrospective and filters on
+// closed; the live league product filters on has_data. One combined "available" flag would
+// serve a wrong list to one of them.
+describe('GET /v1/seasons', () => {
+  let env, caches;
+
+  beforeEach(() => { env = createMockEnv(); caches = mockCaches(); });
+  afterEach(() => caches.cleanup());
+
+  const seasons = async (e = env) => (await get(e, '/v1/seasons')).json();
+
+  // THE STATE THIS WEEK: 2026 is detected and owns literally no keys. It must appear as
+  // current-with-no-data rather than vanishing and leaving the selector empty.
+  it('lists the current season even when it owns no keys at all', async () => {
+    const body = await seasons();
+    expect(body.current).toBe(DETECTED);
+    expect(body.seasons).toEqual([
+      { season: DETECTED, is_current: true, closed: false, has_data: false },
+    ]);
+  });
+
+  it('reports a closed season that has data, with its final gameweek', async () => {
+    await env.FPL_PULSE_KV.put(kEntrySeason(11, ARCHIVED), JSON.stringify(entryBlob(11, ARCHIVED)));
+    await env.FPL_PULSE_KV.put(kSeasonClosed(ARCHIVED), JSON.stringify({ closed_at: 'x', final_gw: 38 }));
+
+    const body = await seasons();
+    const y2025 = body.seasons.find(s => s.season === ARCHIVED);
+    expect(y2025).toEqual({
+      season: ARCHIVED, is_current: false, closed: true, has_data: true, final_gw: 38,
+    });
+  });
+
+  it('reports an open season that has data', async () => {
+    await env.FPL_PULSE_KV.put(kEntrySeason(11, DETECTED), JSON.stringify(entryBlob(11, DETECTED)));
+
+    const body = await seasons();
+    expect(body.seasons[0]).toEqual({
+      season: DETECTED, is_current: true, closed: false, has_data: true,
+    });
+  });
+
+  // A bootstrap makes a season visible but not browsable — entries-pack would 422.
+  it('does not count a bootstrap alone as data', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(ARCHIVED), JSON.stringify({ events: [] }));
+
+    const y2025 = (await seasons()).seasons.find(s => s.season === ARCHIVED);
+    expect(y2025).toMatchObject({ has_data: false });
+  });
+
+  // Mid-ingest: rosters and queued states exist, blobs do not. entries-pack would 202.
+  // Visible, but the live selector must not offer it — it would render empty.
+  it('does not count a season mid-ingest as data', async () => {
+    await env.FPL_PULSE_KV.put(kLeagueMembers(LEAGUE, ARCHIVED), JSON.stringify([11, 22]));
+    await env.FPL_PULSE_KV.put(kEntryState(11, ARCHIVED), JSON.stringify({ status: 'queued' }));
+
+    const y2025 = (await seasons()).seasons.find(s => s.season === ARCHIVED);
+    expect(y2025).toMatchObject({ has_data: false, closed: false });
+  });
+
+  it('omits final_gw rather than sending null when the marker has none', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonClosed(ARCHIVED), JSON.stringify({ closed_at: 'x' }));
+
+    const y2025 = (await seasons()).seasons.find(s => s.season === ARCHIVED);
+    expect(y2025.closed).toBe(true);
+    expect('final_gw' in y2025).toBe(false);
+  });
+
+  // Newest first: both selectors take their default from index 0.
+  it('orders newest season first', async () => {
+    for (const y of [2023, 2024, 2025]) {
+      await env.FPL_PULSE_KV.put(kEntrySeason(11, y), JSON.stringify(entryBlob(11, y)));
+    }
+    expect((await seasons()).seasons.map(s => s.season)).toEqual([2026, 2025, 2024, 2023]);
+  });
+
+  it('is edge cached', async () => {
+    await get(env, '/v1/seasons');
+    expect(caches.store.has('https://worker.dev/v1/seasons')).toBe(true);
+    expect((await get(env, '/v1/seasons')).headers.get('X-Cache')).toBe('HIT');
+  });
+
+  // One character from the singular /v1/season/* globals, and ahead of the season-prefix
+  // matcher. Neither may capture the other.
+  it('does not collide with the singular /v1/season/* routes', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonElements(DETECTED), JSON.stringify({ last_gw_processed: 1, gws: { 1: {} } }));
+
+    expect((await get(env, '/v1/season/elements')).status).toBe(200);
+    expect((await (await get(env, '/v1/seasons')).json()).current).toBe(DETECTED);
   });
 });

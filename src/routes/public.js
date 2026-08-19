@@ -1,5 +1,5 @@
 import { json, cacheHeaders, cacheKeyFor, dynamicCacheHeaders, parseSeasonToken, MIN_SEASON, maxSeason, CORS, log } from '../lib/utils.js';
-import { kvGetJSON, kSeasonBootstrap, kSeasonElements, kSnapshotCurrent, kLeagueMembers, kLeagueStandings, kEntrySeason, kEntryState, kHealthStateSummary, isSeasonElements, isEntrySeason, isLeagueMembers, isLeagueStandings, cacheFirstKV, MAX_LEAGUE_SIZE } from '../lib/kv.js';
+import { kvGetJSON, kSeasonBootstrap, kSeasonElements, kSnapshotCurrent, kLeagueMembers, kLeagueStandings, kEntrySeason, kEntryState, kSeasonClosed, kHealthStateSummary, collectSeasonIndex, isSeasonElements, isEntrySeason, isLeagueMembers, isLeagueStandings, cacheFirstKV, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { circuitBreaker, fetchJsonWithRetry } from '../lib/fpl-api.js';
 
 // Handles all public routes. Returns a Response or null (no match).
@@ -107,6 +107,61 @@ export async function handlePublicRoute(request, env, season) {
         version: env.APP_VERSION || "dev",
       }, 503);
     }
+  }
+
+  // Season discovery. NOT season-scoped itself, so it sits ahead of the prefix matcher as
+  // a plain literal. Note it is one character from the SINGULAR /v1/season/* globals; the
+  // two are unrelated and neither should be renamed into the other's shape.
+  //
+  // Two independent flags because the two consumers ask different questions: Wrapped is
+  // retrospective and filters on `closed`; the live league product filters on `has_data`.
+  // Collapsing them into one "available" flag would serve one consumer a wrong list.
+  //
+  // Cached for an hour, not the usual 7 days. `closed` flips at a harvest (purgeable, and
+  // /v1/seasons is in warmCache's queue), but `has_data` flips on the FIRST entry blob
+  // build — inside processQueuedEntries, which runs on a cron tick with no harvest and so
+  // no purge. A hard TTL would leave a newly-populated season missing from the live
+  // selector for up to a week, which is precisely the transition this endpoint exists to
+  // report. An hour of staleness at a twice-a-year boundary is the cheaper error.
+  if (path === "/v1/seasons") {
+    const cache = caches.default;
+    const ck = cacheKeyFor(request);
+    const edge = await cache.match(ck);
+    if (edge) {
+      const r = new Response(edge.body, edge);
+      r.headers.set("X-Cache", "HIT");
+      r.headers.set("X-App-Version", env.APP_VERSION || "dev");
+      return r;
+    }
+
+    const index = await collectSeasonIndex(env.FPL_PULSE_KV, season);
+
+    // final_gw only for closed seasons, and only when the marker actually records one.
+    // Omitted rather than null when unknown — a null that should be 38 reads as data.
+    const years = [...index.keys()].sort((a, b) => b - a); // newest first: both selectors default to index 0
+    const seasons = [];
+    for (const year of years) {
+      const s = index.get(year);
+      const entry = {
+        season: year,
+        is_current: year === season,
+        closed: s.closed,
+        has_data: s.has_data,
+      };
+      if (s.closed) {
+        const marker = await kvGetJSON(env.FPL_PULSE_KV, kSeasonClosed(year));
+        if (Number.isInteger(marker?.final_gw)) entry.final_gw = marker.final_gw;
+      }
+      seasons.push(entry);
+    }
+
+    const resp = json({ current: season, seasons }, 200, {
+      ...cacheHeaders(3600, 300),
+      "X-Cache": "MISS",
+      "X-App-Version": env.APP_VERSION || "dev",
+    });
+    try { await cache.put(ck, resp.clone()); } catch {}
+    return resp;
   }
 
   // === Public READ endpoints (edge -> KV only) ===

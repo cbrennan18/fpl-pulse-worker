@@ -499,3 +499,57 @@ describe('GET /admin/kv/audit — closed state', () => {
     expect(body.issues.unknown_keys).toEqual([]);
   });
 });
+
+// The manual close used to record final_gw: null while the automatic path recorded the
+// real gameweek. /v1/seasons exposes this field, and a null that should be 38 reads as
+// data at the consumer.
+describe('manual close derives final_gw', () => {
+  let env;
+
+  // n events, the first `finished` of them complete.
+  const boot = (n, finished) => ({
+    events: Array.from({ length: n }, (_, i) => ({
+      id: i + 1, finished: i < finished, data_checked: i < finished,
+    })),
+  });
+
+  const close = (season, body = {}) =>
+    adminPost(env, `/admin/season/${season}/close`, { confirm_season: season, ...body });
+
+  beforeEach(() => { env = createMockEnv(); });
+
+  it('reads the finishing gameweek from the season\'s own stored bootstrap', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(OLD), JSON.stringify(boot(38, 38)));
+
+    expect((await (await close(OLD)).json()).final_gw).toBe(38);
+    expect(env.FPL_PULSE_KV._getJSON(kSeasonClosed(OLD)).final_gw).toBe(38);
+  });
+
+  // A curtailed season stopped before its last scheduled event. The max event id would say
+  // 38; the last gameweek that actually completed is the useful fact.
+  it('records where a curtailed season actually stopped, not its scheduled length', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(OLD), JSON.stringify(boot(38, 29)));
+
+    expect((await (await close(OLD)).json()).final_gw).toBe(29);
+  });
+
+  it('lets an explicit body value win over the derivation', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(OLD), JSON.stringify(boot(38, 38)));
+
+    expect((await (await close(OLD, { final_gw: 29 })).json()).final_gw).toBe(29);
+  });
+
+  // Absent, never null: the consumer can tell "unknown" from a real gameweek.
+  it('omits the field entirely when there is no stored bootstrap to derive from', async () => {
+    const body = await (await close(OLD)).json();
+
+    expect('final_gw' in body).toBe(false);
+    expect('final_gw' in env.FPL_PULSE_KV._getJSON(kSeasonClosed(OLD))).toBe(false);
+  });
+
+  it('omits the field when the stored bootstrap has no finished gameweeks', async () => {
+    await env.FPL_PULSE_KV.put(kSeasonBootstrap(OLD), JSON.stringify(boot(38, 0)));
+
+    expect('final_gw' in (await (await close(OLD)).json())).toBe(false);
+  });
+});

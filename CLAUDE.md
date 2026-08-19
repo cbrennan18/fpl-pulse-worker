@@ -247,7 +247,7 @@ All require authentication via `X-Refresh-Token` header.
 | `/admin/backfill?limit=N&leagueId=L` | POST | Batch process queued entries |
 | `/admin/kv/audit` | GET | Full KV namespace audit with categorization and issue detection. `issues.old_season_keys` are deletable; `issues.archival_keys` are refused by cleanup |
 | `/admin/kv/cleanup` | POST | Targeted KV cleanup (`{"dry_run": true, "targets": ["closed_season"\|"orphaned_entries"], "confirm_count": N}`). **Refuses archival keys**, and `closed_season` only touches seasons with a recorded close marker. `old_season` is a deprecated alias |
-| `/admin/season/:year/close` | POST | Manually close a season (body `{confirm_season}`, optional `final_gw`). For a curtailed season the automatic trigger never fires on |
+| `/admin/season/:year/close` | POST | Manually close a season (body `{confirm_season}`, optional `final_gw`). For a curtailed season the automatic trigger never fires on. `final_gw` is derived from that season's stored bootstrap via `detectLatestFinishedGW` when not supplied, and **omitted rather than null** when underivable |
 | `/admin/season/:year/reopen` | POST | Override immutability for a repair (body `{confirm_season}`). Logs at WARN. Re-close when done |
 | `/admin/kv/migrate-members` | POST | One-off copy of legacy `league:<id>:members` → `league:<id>:<season>:members`. `season` required (never defaulted), `dry_run` default true, **copies without deleting**. Blocks any key with no entry-blob or entry-state footprint in the season being stamped; `allow_unverified: true` overrides |
 
@@ -275,6 +275,24 @@ All require authentication via `X-Refresh-Token` header.
 Dispatch ordering in `public.js` is **load-bearing**. `/v1/season/bootstrap` and `/v1/season/elements` put the literal word `season` in the same positional slot the year occupies, so `/v1/season/elements` and `/v1/2025/elements` are structurally identical — three segments, same shape. They only fail to collide because `season` is not digits. The prefix matcher therefore requires an all-digit segment, and the token is validated by `parseSeasonToken`'s `/^\d{4}$/` — never a bare `Number()`, which also accepts `" 2025"`, `"2025.0"` and `"2e3"` and would then build a KV key that silently addresses nothing. Range: 2016 → current year + 1. A purely numeric segment can only be a season attempt, so a malformed one is a 400, not a 404.
 
 The three global routes go through `cacheFirstKV`, which applies a flat 7-day `cacheHeaders()` rather than `dynamicCacheHeaders`. For a closed season that is conservative in the harmless direction (7d instead of the 30d the end-of-season branch would give). Noted so it isn't mistaken for a bug.
+
+**`GET /v1/seasons` — season discovery.** Public, unauthenticated. The list both frontend selectors read:
+
+```json
+{ "current": 2026,
+  "seasons": [ { "season": 2026, "is_current": true,  "closed": false, "has_data": false },
+               { "season": 2025, "is_current": false, "closed": true,  "has_data": true, "final_gw": 38 } ] }
+```
+
+`closed` and `has_data` are **separate flags, not one availability flag** — the consumers ask different questions. Wrapped is retrospective and offers `closed` seasons only. Mini-leagues / GW Awards is the live product and offers `has_data` seasons. Collapsing them serves one of the two a wrong list. Newest first, so both take their default from index 0. `final_gw` appears only for closed seasons whose marker records one; **omitted, never null**.
+
+`has_data` means **at least one `entry:<id>:<season>` blob** — precisely the threshold at which entries-pack starts returning 200. A bootstrap alone 422s; a season mid-ingest with queued states but no blobs 202s. Both are visible in the list but not offered, because either would render an empty league.
+
+A season is **visible** if any season-scoped key mentions it, **plus the detected current season is always included even with zero keys**. That is the real state of a new season between FPL's rollover and its first harvest — current, no data — and it must be representable rather than an absence that empties the selector.
+
+**Cost:** one namespace `list` (one page below 1000 keys; ~212 today) plus one `get` per closed season. KV list ops don't count against the subrequest budget. A stored index isn't warranted until the namespace needs multiple list round-trips — roughly 5 seasons at ~200 keys each. Note `createMockKV.list()` ignores `cursor`, so the multi-page path is **not** covered by tests.
+
+**Cached 1h, not the usual 7 days.** `closed` flips at a harvest, which is purgeable — `/v1/seasons` is in warmCache's queue. But `has_data` flips on the *first entry blob build*, inside `processQueuedEntries` on a plain cron tick with no harvest and therefore no purge. A hard TTL would leave a newly-populated season missing from the live selector for up to a week, which is exactly the transition this endpoint exists to report.
 
 **Standings route serves FINAL tables only.** `isLeagueStandings` requires `final` to be a *boolean*, not to be `true` — a provisional capture validates exactly like a completed one, and `archiveLeagueStandings` writes a fresh provisional table on every run between the last gameweek and FPL's rollover. So the route carries its own `final === true` check on top of the guard:
 
@@ -347,7 +365,7 @@ Step 3 is what reclaims the complexity; steps 1–2 reclaim the budget. They can
 ## Commands
 
 ```bash
-npx vitest run          # Run test suite (216 tests)
+npx vitest run          # Run test suite (230 tests)
 npx wrangler dev        # Local development server
 npx wrangler deploy     # Deploy to Cloudflare
 ```

@@ -736,6 +736,10 @@ export async function warmCache(env) {
   // each /v1 artefact are queued (see the note above); /fpl/* has only one form.
   const urls = [
     // Priority 1: global — every page depends on these
+    // /v1/seasons: a harvest can flip `closed`, and the first harvest of a new season
+    // flips `has_data`. Its own 1h TTL is the backstop for the has_data flip that happens
+    // between harvests (a first entry build on a plain cron tick).
+    `${base}/v1/seasons`,
     `${base}/v1/season/elements`,
     `${base}/v1/season/bootstrap`,
     `${base}/v1/${season}/elements`,

@@ -1,5 +1,5 @@
 import { json, log, cacheKeyFor, checkIdempotencyKey, storeIdempotencyResult, fallbackSeason, parseSeasonToken, MIN_SEASON, maxSeason } from '../lib/utils.js';
-import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kDetectedSeason, kSeasonClosed, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
+import { kvGetJSON, kvPutJSON, kEntryState, kEntrySeason, kLeagueMembers, kSeasonBootstrap, kDetectedSeason, kSeasonClosed, isLeagueMembers, MAX_LEAGUE_SIZE } from '../lib/kv.js';
 import { fetchJson, fetchBootstrap, circuitBreaker, sleep } from '../lib/fpl-api.js';
 import { processEntryOnce } from '../services/entry.js';
 import { harvestIfNeeded, warmCache, processPurgeQueue, backfillSeasonElements, detectLatestFinishedGW, archiveAllLeagueStandings } from '../services/harvest.js';
@@ -248,13 +248,26 @@ export async function handleAdminRoute(request, env, season) {
       if (existing) {
         return json({ ok: true, status: "already_closed", season: targetSeason, ...existing }, 200);
       }
+      // Derive the finishing gameweek rather than recording null. The automatic close gets
+      // it from the harvest that triggered it; a manual close reads the season's OWN stored
+      // bootstrap. detectLatestFinishedGW (last gameweek that actually completed), not
+      // detectFinalGW (max event id): they agree for a full season, but for a curtailed one
+      // the max id overstates it — 2019/20 would claim 38 when play stopped earlier, and
+      // "the gameweek the season ended on" is the useful fact.
+      //
+      // Omitted, never null, when no stored bootstrap exists: a null that should be 38 is
+      // indistinguishable from a real value at the consumer.
+      let finalGw = Number.isInteger(Number(body.final_gw)) ? Number(body.final_gw) : null;
+      if (finalGw === null) {
+        finalGw = detectLatestFinishedGW(await kvGetJSON(env.FPL_PULSE_KV, kSeasonBootstrap(targetSeason)));
+      }
       const marker = {
         closed_at: new Date().toISOString(),
-        final_gw: Number.isInteger(Number(body.final_gw)) ? Number(body.final_gw) : null,
         closed_by: "admin",
       };
+      if (Number.isInteger(finalGw)) marker.final_gw = finalGw;
       await kvPutJSON(env.FPL_PULSE_KV, key, marker);
-      log.info("season", "closed", { season: targetSeason, source: "admin", final_gw: marker.final_gw });
+      log.info("season", "closed", { season: targetSeason, source: "admin", final_gw: marker.final_gw ?? null });
       const closeResult = { ok: true, status: "closed", season: targetSeason, ...marker };
       if (idempotencyKey) await storeIdempotencyResult(env, idempotencyKey, closeResult, 200);
       return json(closeResult, 200);

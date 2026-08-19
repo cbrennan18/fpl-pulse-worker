@@ -77,6 +77,53 @@ export async function isSeasonClosed(kv, season) {
   return (await kvGetJSON(kv, kSeasonClosed(season))) !== null;
 }
 
+// === Season discovery ===
+//
+// Builds the season list for GET /v1/seasons from a single namespace scan. Two facts per
+// season, kept separate because the two consumers ask DIFFERENT questions:
+//
+//   closed    — the season is over. Wrapped is retrospective and only offers these.
+//   has_data  — at least one entry:<id>:<season> blob exists. The live league product
+//               offers these.
+//
+// has_data is deliberately "at least one entry BLOB", not "any key for this season":
+//   - a bootstrap alone is not browsable (entries-pack 422s: members may exist, blobs do not)
+//   - queued/building states alone are not browsable either (entries-pack 202s) — it WILL
+//     be browsable, but is not yet, and the selector must not offer a season that renders
+//     empty
+// One blob is exactly the threshold at which entries-pack starts returning 200, so this
+// mirrors the contract the consumer actually depends on rather than guessing a proxy.
+//
+// A season becomes VISIBLE if any season-scoped key mentions it. The caller additionally
+// forces the detected current season into the list even when it owns zero keys — that is
+// the real state of a new season between FPL's rollover and its first harvest, and it must
+// be representable (current, no data) rather than an absence that empties the list.
+export async function collectSeasonIndex(kv, currentSeason) {
+  const seasons = new Map();
+  const touch = (year) => {
+    if (!seasons.has(year)) seasons.set(year, { closed: false, has_data: false });
+    return seasons.get(year);
+  };
+
+  let cursor;
+  do {
+    const page = await kv.list({ cursor, limit: 1000 });
+    cursor = page.cursor;
+    for (const { name } of page.keys) {
+      let m;
+      if ((m = name.match(/^season:(\d{4}):closed$/))) { touch(Number(m[1])).closed = true; continue; }
+      if ((m = name.match(/^entry:\d+:(\d{4})$/)))     { touch(Number(m[1])).has_data = true; continue; }
+      // Present but not browsable on their own — they only make the season visible.
+      if ((m = name.match(/^season:(\d{4}):(bootstrap|elements)$/))) { touch(Number(m[1])); continue; }
+      if ((m = name.match(/^entry:\d+:(\d{4}):state$/)))            { touch(Number(m[1])); continue; }
+      if ((m = name.match(/^league:\d+:(\d{4}):(members|standings)$/))) { touch(Number(m[1])); continue; }
+    }
+  } while (cursor);
+
+  if (Number.isInteger(currentSeason)) touch(currentSeason);
+  return seasons;
+}
+
 // === Limits ===
 export const MAX_LEAGUE_SIZE = 50; // friends-only mini leagues
 
